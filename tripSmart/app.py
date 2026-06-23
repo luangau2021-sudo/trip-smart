@@ -108,8 +108,12 @@ except Exception:
     _SPEED_LIMIT_OK = False
 # ============================================
 
-st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
-                   layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="TripSmart Pro",
+    page_icon="favicon.png",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 load_global_styles()
 
