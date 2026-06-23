@@ -108,9 +108,14 @@ except Exception:
     _SPEED_LIMIT_OK = False
 # ============================================
 
+import os
+import streamlit as st
+
+ICON_PATH = os.path.join(os.path.dirname(__file__), "favicon.png")
+
 st.set_page_config(
     page_title="TripSmart Pro",
-    page_icon="favicon.png",
+    page_icon=ICON_PATH,
     layout="wide",
     initial_sidebar_state="expanded"
 )
