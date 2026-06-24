@@ -117,8 +117,17 @@ except Exception:
     _TOMTOM_SPEED_LIMIT_OK = False
 # ============================================
 
-st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
-                   layout="wide", initial_sidebar_state="expanded")
+import os
+import streamlit as st
+
+ICON_PATH = os.path.join(os.path.dirname(__file__), "favicon.png")
+
+st.set_page_config(
+    page_title="TripSmart Pro",
+    page_icon=ICON_PATH,
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 load_global_styles()
 
