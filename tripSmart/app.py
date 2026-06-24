@@ -124,6 +124,38 @@ load_global_styles()
 
 st.markdown("""
 <style>
+
+/* FIX MOBILE: hạ nút đóng/mở sidebar xuống để không bị fact trên cùng che */
+@media (max-width: 760px) {
+    div[data-testid="collapsedControl"] {
+        top: 48px !important;
+        z-index: 2147483700 !important;
+    }
+
+    section[data-testid="stSidebar"] button[data-testid="baseButton-headerNoPadding"],
+    section[data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"],
+    button[data-testid="baseButton-headerNoPadding"],
+    button[data-testid="stBaseButton-headerNoPadding"],
+    button[title="Close sidebar"],
+    button[title="Open sidebar"],
+    button[aria-label="Close sidebar"],
+    button[aria-label="Open sidebar"],
+    button[aria-label="Show sidebar navigation"],
+    button[aria-label="Hide sidebar navigation"] {
+        transform: translateY(36px) !important;
+        z-index: 2147483700 !important;
+    }
+
+    section[data-testid="stSidebar"] > div:first-child {
+        padding-top: 34px !important;
+    }
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
 /* tripsmart mobile compact placement final */
 @media (max-width: 760px) {
     .main .block-container { padding-bottom: 72px !important; }
