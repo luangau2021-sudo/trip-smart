@@ -2012,8 +2012,11 @@ def _render_home_dashboard():
     except Exception:
         pass
     st.markdown(
-        '<div class="ts-hero"><h1>🗺️ TripSmart Pro</h1>'
-        '<p>Chạm vào biểu tượng để mở chức năng. Tất cả công cụ vẫn đầy đủ, nhưng dễ nhận diện hơn.</p></div>',
+        """
+        <div class="ts-hero">
+            <h1>🗺️ TripSmart Pro</h1>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
     st.markdown('<div class="ts-section-title">🔥 Tiện ích nổi bật</div>', unsafe_allow_html=True)
@@ -2476,8 +2479,6 @@ except Exception:
 
 with st.sidebar:
     st.markdown("## 🗺️ TripSmart Pro")
-    st.caption("Dễ nhìn · Dễ bấm · Đủ chức năng")
-
     # SOS compact: chỉ còn ô tên, ô số điện thoại và dấu +.
     # Không dùng expander/caption dài để người dùng thấy ngay phần nhập.
     _render_sos_contacts_manager_compact(prefix="sidebar_sos_family")
