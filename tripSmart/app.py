@@ -125,6 +125,34 @@ load_global_styles()
 st.markdown("""
 <style>
 
+/* FINAL MOBILE FIX: không để fact che nút mở/đóng sidebar */
+@media (max-width: 760px) {
+    .ts-fact-compact {
+        left: 54px !important;
+        right: 8px !important;
+        top: calc(env(safe-area-inset-top, 0px) + 6px) !important;
+        z-index: 9999 !important;
+        pointer-events: none !important;
+    }
+
+    /* Một số bản Streamlit dùng header/button selector khác nhau */
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="baseButton-headerNoPadding"],
+    [data-testid="stBaseButton-headerNoPadding"],
+    button[kind="header"],
+    header button,
+    section[data-testid="stSidebar"] button {
+        z-index: 2147483700 !important;
+    }
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+
 /* FIX MOBILE V2: hạ CẢ nút đóng và nút mở sidebar.
    Nút đóng nằm trong sidebar, nút mở nằm ngoài sidebar nên phải target riêng. */
 @media (max-width: 760px) {
@@ -2396,10 +2424,10 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             }}
             .ts-fact-compact {{
                 position: fixed;
-                left: 10px;
+                left: 58px;
                 right: 10px;
                 top: calc(env(safe-area-inset-top, 0px) + 8px);
-                z-index: 2147483000;
+                z-index: 9999;
                 max-width: none;
                 width: auto;
                 background: rgba(255,255,255,.97);
@@ -2417,14 +2445,16 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             }}
             @media (max-width: 760px) {{
                 .ts-fact-compact {{
-                    left: 8px;
+                    left: 54px;
                     right: 8px;
                     top: calc(env(safe-area-inset-top, 0px) + 6px);
+                    z-index: 9999;
                     max-width: none;
                     padding: 7px 9px;
                     font-size: 12.5px;
                     line-height: 1.25;
                     border-radius: 12px;
+                    pointer-events: none;
                 }}
             }}
             </style>
