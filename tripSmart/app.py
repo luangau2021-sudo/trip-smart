@@ -117,17 +117,8 @@ except Exception:
     _TOMTOM_SPEED_LIMIT_OK = False
 # ============================================
 
-import os
-import streamlit as st
-
-ICON_PATH = os.path.join(os.path.dirname(__file__), "favicon.png")
-
-st.set_page_config(
-    page_title="TripSmart Pro",
-    page_icon=ICON_PATH,
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
+                   layout="wide", initial_sidebar_state="expanded")
 
 load_global_styles()
 
@@ -2175,6 +2166,210 @@ def _render_sos_contacts_manager_compact(prefix: str = "sidebar_sos_family"):
         except Exception as e:
             st.warning(f"Không thêm được số: {e}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOBILE COMPACT OVERLAYS: SOS + MICRO FACT
+# ─────────────────────────────────────────────────────────────────────────────
+def _render_compact_floating_sos_button(prefix: str = "global_float_sos"):
+    """
+    SOS nổi cực gọn cho điện thoại:
+    - Chỉ còn 1 nút: 🆘 GỬI SOS
+    - Không hiện GPS/status/chú thích trong card nổi.
+    - Vẫn mở SMS tới tất cả số người thân đã lưu.
+    """
+    try:
+        import html as _html
+        _sos_init_state()
+
+        contacts = _sos_get_family_contacts() or []
+        numbers = ",".join(
+            _sos_normalize_phone_for_sms(c.get("phone"))
+            for c in contacts
+            if c and c.get("phone")
+        )
+
+        lat = st.session_state.get("nav_gps_lat")
+        lon = st.session_state.get("nav_gps_lon")
+
+        # Fallback nhẹ: dùng điểm xuất phát/tuyến nếu chưa có GPS live trong session.
+        try:
+            if (lat is None or lon is None) and st.session_state.get("last_origin"):
+                lat, lon = st.session_state.get("last_origin")
+        except Exception:
+            pass
+
+        try:
+            lat_f = float(lat) if lat is not None else None
+            lon_f = float(lon) if lon is not None else None
+        except Exception:
+            lat_f = lon_f = None
+
+        if lat_f is not None and lon_f is not None:
+            msg = _sos_message_template("Khẩn cấp", lat_f, lon_f, "Tôi cần giúp đỡ ngay.")
+        else:
+            msg = "🆘 Tôi cần giúp đỡ ngay. Hiện chưa lấy được GPS chính xác."
+
+        if numbers:
+            href = _sos_build_sms_link(numbers, msg)
+            onclick = ""
+        else:
+            href = "#"
+            onclick = "alert('Bạn chưa nhập số người thân trong sidebar.'); return false;"
+
+        href = _html.escape(str(href), quote=True)
+        onclick = _html.escape(str(onclick), quote=True)
+
+        st.markdown(
+            f"""
+            <style>
+            .ts-compact-sos-btn {{
+                position: fixed;
+                right: 10px;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+                z-index: 2147483600;
+                width: 108px;
+                height: 48px;
+                border-radius: 18px;
+                background: linear-gradient(135deg, #ff3b3b, #ff6b6b);
+                color: #fff !important;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                text-decoration: none !important;
+                font-weight: 900;
+                font-size: 13px;
+                letter-spacing: .01em;
+                box-shadow: 0 10px 26px rgba(220, 38, 38, .38);
+                border: 2px solid rgba(255,255,255,.9);
+                -webkit-tap-highlight-color: transparent;
+            }}
+            .ts-compact-sos-btn:active {{
+                transform: scale(.97);
+            }}
+            @media (max-width: 760px) {{
+                .ts-compact-sos-btn {{
+                    width: 94px;
+                    height: 42px;
+                    right: 8px;
+                    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+                    border-radius: 16px;
+                    font-size: 12px;
+                }}
+            }}
+            </style>
+            <a class="ts-compact-sos-btn" href="{href}" onclick="{onclick}">🆘 GỬI SOS</a>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        # Không để lỗi UI SOS làm sập app.
+        pass
+
+
+def _render_safety_quiz(key_prefix: str = "safety_quiz"):
+    """
+    Micro fact cực gọn:
+    - Chỉ hiện fact.
+    - Không hiện category, tiêu đề, "Không cần trả lời", "tự đổi sau 5 phút".
+    - Card nhỏ hơn và né nút SOS ở điện thoại.
+    """
+    try:
+        import time as _time
+        import html as _html
+
+        try:
+            from core.microlearning import (
+                FACT_HISTORY_KEY, build_micro_context, load_fact_bank,
+                remember_fact, select_micro_fact,
+            )
+        except Exception:
+            return
+
+        route_risk_forecast = st.session_state.get("last_route_risk_forecast") or st.session_state.get("route_risk_forecast")
+        danger_markers = st.session_state.get("last_danger_markers") or st.session_state.get("danger_markers") or []
+        mode = st.session_state.get("last_mode") or st.session_state.get("mode") or "car"
+        weather_text = st.session_state.get("last_weather_text") or st.session_state.get("weather_desc") or ""
+        speed_kmh = st.session_state.get("gps_speed_kmh") or st.session_state.get("current_speed_kmh")
+
+        context = build_micro_context(
+            mode=mode,
+            weather_text=weather_text,
+            route_risk_forecast=route_risk_forecast,
+            danger_markers=danger_markers,
+            speed_kmh=speed_kmh,
+        )
+
+        facts = load_fact_bank()
+        recent_ids = st.session_state.get(FACT_HISTORY_KEY, [])
+        current_bucket = int(_time.time() // 300)
+        fact_key = f"{key_prefix}_compact_fact_b{current_bucket}"
+        st.session_state.pop(f"{key_prefix}_compact_fact_b{current_bucket - 1}", None)
+
+        fact = st.session_state.get(fact_key)
+        if not fact:
+            fact = select_micro_fact(context=context, recent_ids=recent_ids, facts=facts, language="vi")
+            if fact:
+                st.session_state[fact_key] = fact
+                remember_fact(st.session_state, str(fact.get("id", "")))
+
+        if not fact:
+            return
+
+        fact_text = str(fact.get("text", "")).strip()
+        if not fact_text:
+            return
+
+        fact_text = _html.escape(fact_text)
+
+        st.markdown(
+            f"""
+            <style>
+            .tripsmart-microfact-float,
+            .tripsmart-microfact-title,
+            .tripsmart-microfact-meta {{
+                display: none !important;
+            }}
+            .ts-fact-compact {{
+                position: fixed;
+                left: 10px;
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+                z-index: 2147483000;
+                max-width: 330px;
+                width: auto;
+                background: rgba(255,255,255,.96);
+                color: #1f2937;
+                border: 1px solid rgba(255, 71, 87, .20);
+                border-left: 4px solid #ff4757;
+                border-radius: 14px;
+                box-shadow: 0 10px 24px rgba(15, 23, 42, .16);
+                padding: 8px 11px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                font-size: 13px;
+                line-height: 1.28;
+                font-weight: 700;
+                pointer-events: none;
+            }}
+            @media (max-width: 760px) {{
+                .ts-fact-compact {{
+                    left: 8px;
+                    right: 112px;
+                    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+                    max-width: none;
+                    padding: 7px 9px;
+                    font-size: 12.5px;
+                    line-height: 1.25;
+                    border-radius: 12px;
+                }}
+            }}
+            </style>
+            <div class="ts-fact-compact">💡 {fact_text}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2284,7 +2479,7 @@ with st.sidebar:
                         st.rerun()
 
 # SOS nổi cố định: luôn hiện ở góc màn hình, không bị cuộn theo sidebar.
-_render_floating_sos_button(prefix="global_float_sos")
+_render_compact_floating_sos_button(prefix="global_float_sos")
 
 # ── Nhịp 5 phút an toàn cho ETA/risk ─────────────────────────────────────────
 # Bật lại st_autorefresh nhưng chỉ dùng để cập nhật ETA/risk theo bucket 5 phút.
@@ -2319,8 +2514,7 @@ except Exception:
     _tripsmart_5min_bucket = int(datetime.now().timestamp() // 300)
     st.session_state["__tripsmart_5min_bucket"] = _tripsmart_5min_bucket
 
-# 💡 Micro fact nổi cố định.
-# route_panels.py bản client-side sẽ tự đổi fact bằng JS, không cần rerun toàn app.
+# 💡 Micro fact nổi cố định bản gọn: chỉ hiện fact, không chú thích.
 _render_safety_quiz(key_prefix="global_micro_fact")
 
 if not MODULES_OK:
