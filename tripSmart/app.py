@@ -122,6 +122,15 @@ st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
 
 load_global_styles()
 
+st.markdown("""
+<style>
+/* tripsmart mobile compact placement final */
+@media (max-width: 760px) {
+    .main .block-container { padding-bottom: 72px !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 # ── Không làm mờ UI khi Streamlit rerun / spinner ────────────────────────────
 # Streamlit mặc định giảm opacity giao diện trong lúc script chạy.
@@ -2224,7 +2233,7 @@ def _render_compact_floating_sos_button(prefix: str = "global_float_sos"):
             <style>
             .ts-compact-sos-btn {{
                 position: fixed;
-                right: 10px;
+                left: 10px;
                 bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
                 z-index: 2147483600;
                 width: 108px;
@@ -2250,7 +2259,7 @@ def _render_compact_floating_sos_button(prefix: str = "global_float_sos"):
                 .ts-compact-sos-btn {{
                     width: 94px;
                     height: 42px;
-                    right: 8px;
+                    left: 8px;
                     bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
                     border-radius: 16px;
                     font-size: 12px;
@@ -2332,16 +2341,17 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             .ts-fact-compact {{
                 position: fixed;
                 left: 10px;
-                bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+                right: 10px;
+                top: calc(env(safe-area-inset-top, 0px) + 8px);
                 z-index: 2147483000;
-                max-width: 330px;
+                max-width: none;
                 width: auto;
-                background: rgba(255,255,255,.96);
+                background: rgba(255,255,255,.97);
                 color: #1f2937;
                 border: 1px solid rgba(255, 71, 87, .20);
                 border-left: 4px solid #ff4757;
                 border-radius: 14px;
-                box-shadow: 0 10px 24px rgba(15, 23, 42, .16);
+                box-shadow: 0 8px 22px rgba(15, 23, 42, .14);
                 padding: 8px 11px;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                 font-size: 13px;
@@ -2352,8 +2362,8 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             @media (max-width: 760px) {{
                 .ts-fact-compact {{
                     left: 8px;
-                    right: 112px;
-                    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+                    right: 8px;
+                    top: calc(env(safe-area-inset-top, 0px) + 6px);
                     max-width: none;
                     padding: 7px 9px;
                     font-size: 12.5px;
