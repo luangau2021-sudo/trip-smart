@@ -125,65 +125,15 @@ load_global_styles()
 st.markdown("""
 <style>
 
-/* FINAL MOBILE FIX: không để fact che nút mở/đóng sidebar */
+/* FIX MOBILE: hạ nút đóng/mở sidebar xuống để không bị fact trên cùng che */
 @media (max-width: 760px) {
-    .ts-fact-compact {
-        left: 54px !important;
-        right: 8px !important;
-        top: calc(env(safe-area-inset-top, 0px) + 6px) !important;
-        z-index: 9999 !important;
-        pointer-events: none !important;
-    }
-
-    /* Một số bản Streamlit dùng header/button selector khác nhau */
-    [data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapsedControl"],
-    [data-testid="baseButton-headerNoPadding"],
-    [data-testid="stBaseButton-headerNoPadding"],
-    button[kind="header"],
-    header button,
-    section[data-testid="stSidebar"] button {
+    div[data-testid="collapsedControl"] {
+        top: 48px !important;
         z-index: 2147483700 !important;
     }
-}
 
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<style>
-
-/* FIX MOBILE V2: hạ CẢ nút đóng và nút mở sidebar.
-   Nút đóng nằm trong sidebar, nút mở nằm ngoài sidebar nên phải target riêng. */
-@media (max-width: 760px) {
-    /* Nút MỞ sidebar khi sidebar đang đóng */
-    div[data-testid="collapsedControl"],
-    div[data-testid="stSidebarCollapsedControl"],
-    [data-testid="collapsedControl"],
-    [data-testid="stSidebarCollapsedControl"] {
-        position: fixed !important;
-        top: calc(env(safe-area-inset-top, 0px) + 50px) !important;
-        left: 10px !important;
-        z-index: 2147483700 !important;
-        transform: none !important;
-        margin-top: 0 !important;
-    }
-
-    div[data-testid="collapsedControl"] button,
-    div[data-testid="stSidebarCollapsedControl"] button,
-    [data-testid="collapsedControl"] button,
-    [data-testid="stSidebarCollapsedControl"] button {
-        transform: none !important;
-        margin-top: 0 !important;
-        z-index: 2147483701 !important;
-    }
-
-    /* Nút ĐÓNG sidebar khi sidebar đang mở */
     section[data-testid="stSidebar"] button[data-testid="baseButton-headerNoPadding"],
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"],
-    section[data-testid="stSidebar"] button[title="Close sidebar"],
-    section[data-testid="stSidebar"] button[aria-label="Close sidebar"],
-    section[data-testid="stSidebar"] button[aria-label="Hide sidebar navigation"],
     button[data-testid="baseButton-headerNoPadding"],
     button[data-testid="stBaseButton-headerNoPadding"],
     button[title="Close sidebar"],
@@ -203,8 +153,6 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
-
-
 
 st.markdown("""
 <style>
@@ -2424,10 +2372,10 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             }}
             .ts-fact-compact {{
                 position: fixed;
-                left: 58px;
+                left: 10px;
                 right: 10px;
                 top: calc(env(safe-area-inset-top, 0px) + 8px);
-                z-index: 9999;
+                z-index: 2147483000;
                 max-width: none;
                 width: auto;
                 background: rgba(255,255,255,.97);
@@ -2445,16 +2393,14 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             }}
             @media (max-width: 760px) {{
                 .ts-fact-compact {{
-                    left: 54px;
+                    left: 8px;
                     right: 8px;
                     top: calc(env(safe-area-inset-top, 0px) + 6px);
-                    z-index: 9999;
                     max-width: none;
                     padding: 7px 9px;
                     font-size: 12.5px;
                     line-height: 1.25;
                     border-radius: 12px;
-                    pointer-events: none;
                 }}
             }}
             </style>
