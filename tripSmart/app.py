@@ -2373,6 +2373,55 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             .tripsmart-microfact-meta {{
                 display: none !important;
             }}
+            .ts-fact-shell {{
+                position: fixed;
+                inset: auto;
+                z-index: 2147483100;
+                margin: 0;
+                padding: 0;
+            }}
+            .ts-fact-shell > summary {{
+                list-style: none;
+            }}
+            .ts-fact-shell > summary::-webkit-details-marker {{
+                display: none;
+            }}
+            .ts-fact-toggle-btn {{
+                position: fixed;
+                right: 7px;
+                top: calc(env(safe-area-inset-top, 0px) + 6px);
+                z-index: 2147483200;
+                width: 24px;
+                height: 24px;
+                border-radius: 999px;
+                border: 1px solid rgba(255,255,255,.86);
+                background: rgba(17, 24, 39, .84);
+                color: #fff;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 6px 16px rgba(15,23,42,.22);
+                cursor: pointer;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+            }}
+            .ts-fact-shell[open] .ts-fact-toggle-btn::after {{
+                content: "×";
+                font-size: 16px;
+                line-height: 1;
+                font-weight: 900;
+            }}
+            .ts-fact-shell:not([open]) .ts-fact-toggle-btn::after {{
+                content: "💡";
+                font-size: 13px;
+                line-height: 1;
+            }}
+            .ts-fact-shell:not([open]) .ts-fact-compact {{
+                display: none !important;
+            }}
+            .ts-fact-toggle-btn:active {{
+                transform: scale(.94);
+            }}
             .ts-fact-compact {{
                 position: fixed;
                 left: 10px;
@@ -2397,7 +2446,7 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
             @media (max-width: 760px) {{
                 .ts-fact-compact {{
                     left: 8px;
-                    right: 8px;
+                    right: 38px;
                     top: calc(env(safe-area-inset-top, 0px) + 6px);
                     max-width: none;
                     padding: 7px 9px;
@@ -2407,7 +2456,10 @@ def _render_safety_quiz(key_prefix: str = "safety_quiz"):
                 }}
             }}
             </style>
-            <div class="ts-fact-compact">💡 {fact_text}</div>
+            <details class="ts-fact-shell" open>
+                <summary class="ts-fact-toggle-btn" aria-label="Đóng mở mẹo"></summary>
+                <div class="ts-fact-compact">💡 {fact_text}</div>
+            </details>
             """,
             unsafe_allow_html=True,
         )
