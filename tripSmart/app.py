@@ -106,21 +106,66 @@ try:
 except Exception:
     SpeedLimitEngine = None
     _SPEED_LIMIT_OK = False
+
+# TomTom Snap to Roads: lấy tốc độ tối đa hợp pháp tại GPS hiện tại.
+# File cần có: core/tomtom_speed_limit.py
+try:
+    from core.tomtom_speed_limit import get_speed_limit_from_tomtom
+    _TOMTOM_SPEED_LIMIT_OK = True
+except Exception:
+    get_speed_limit_from_tomtom = None
+    _TOMTOM_SPEED_LIMIT_OK = False
 # ============================================
 
-import os
-import streamlit as st
-
-ICON_PATH = os.path.join(os.path.dirname(__file__), "favicon.png")
-
-st.set_page_config(
-    page_title="TripSmart Pro",
-    page_icon=ICON_PATH,
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
+                   layout="wide", initial_sidebar_state="expanded")
 
 load_global_styles()
+
+
+# ── Không làm mờ UI khi Streamlit rerun / spinner ────────────────────────────
+# Streamlit mặc định giảm opacity giao diện trong lúc script chạy.
+# CSS này giữ màn hình rõ để GPS/ETA/các cập nhật nền không gây cảm giác "kẹt".
+st.markdown("""
+<style>
+.stApp,
+section.main,
+main,
+div[data-testid="stAppViewContainer"],
+div[data-testid="stMain"],
+div[data-testid="stMainBlockContainer"],
+div[data-testid="stVerticalBlock"],
+div[data-testid="stElementContainer"],
+div[data-testid="stSidebar"],
+section[data-testid="stSidebar"],
+div[data-testid="stSidebarContent"],
+iframe,
+[data-testid="stIFrame"] {
+    opacity: 1 !important;
+    filter: none !important;
+}
+button,
+button:disabled,
+input,
+input:disabled,
+textarea,
+textarea:disabled,
+select,
+select:disabled,
+div[aria-disabled="true"],
+*[disabled] {
+    opacity: 1 !important;
+    filter: none !important;
+}
+div[data-testid="stStatusWidget"],
+div[data-testid="stDecoration"] {
+    display: none !important;
+    visibility: hidden !important;
+    opacity: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -148,8 +193,8 @@ def init_engines():
             MemoryTrailEngine(), WeatherAPI(), MapsAPI(), AIEngine())
 
 # Ngưỡng màu rủi ro dùng thống nhất toàn app.
-# Theo yêu cầu: chỉ khi score >= 85% mới hiển thị màu đỏ / chấm đỏ.
-RED_RISK_THRESHOLD = 0.85
+# Theo yêu cầu: chỉ khi score >= 90% mới hiển thị màu đỏ / chấm đỏ.
+RED_RISK_THRESHOLD = 0.90
 ORANGE_RISK_THRESHOLD = 0.65
 YELLOW_RISK_THRESHOLD = 0.40
 
@@ -418,6 +463,526 @@ def _run_auto_eta_update(router, risk_engine, weather_api, dest_fallback, mode_f
 
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MANUAL INCIDENT REROUTE APPLY HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _ts_route_signature(polyline):
+    """Chữ ký nhẹ để so tuyến cũ/tuyến mới."""
+    try:
+        pts = polyline or []
+        if not pts:
+            return ()
+        step = max(1, int(len(pts) / 24))
+        sig = []
+        for p in pts[::step]:
+            try:
+                sig.append((round(float(p[0]), 4), round(float(p[1]), 4)))
+            except Exception:
+                pass
+        if pts:
+            last = (round(float(pts[-1][0]), 4), round(float(pts[-1][1]), 4))
+            if not sig or sig[-1] != last:
+                sig.append(last)
+        return tuple(sig)
+    except Exception:
+        return ()
+
+
+def _ts_route_changed_enough(old_route, new_route, incident_lat=None, incident_lon=None):
+    """
+    Tuyến vòng phải khác tuyến cũ đủ rõ.
+    Nếu router trả lại gần như tuyến cũ/direct fallback thì không coi là đổi tuyến.
+    """
+    try:
+        old_poly = (old_route or {}).get("polyline") or []
+        new_poly = (new_route or {}).get("polyline") or []
+        if not old_poly or not new_poly:
+            return bool(new_poly)
+
+        if _ts_route_signature(old_poly) != _ts_route_signature(new_poly):
+            # Nếu signature khác, kiểm thêm độ dài/độ tránh điểm đỏ.
+            old_km = float(_get_route_distance_km(old_route) or _distance_km_from_polyline(old_poly) or 0.0)
+            new_km = float(_get_route_distance_km(new_route) or _distance_km_from_polyline(new_poly) or 0.0)
+            if old_km > 0 and abs(new_km - old_km) / max(old_km, 1.0) >= 0.01:
+                return True
+
+            if incident_lat is not None and incident_lon is not None:
+                old_d = _min_distance_polyline_to_coord_km(old_poly, incident_lat, incident_lon, sample_step=2)
+                new_d = _min_distance_polyline_to_coord_km(new_poly, incident_lat, incident_lon, sample_step=2)
+                if new_d >= old_d + 0.20:
+                    return True
+
+            # Có waypoint thật thì vẫn coi là khác tuyến.
+            if new_route.get("reroute_waypoints"):
+                return True
+
+        return False
+    except Exception:
+        return True
+
+
+# Các anchor đường thật lấy từ bản routing tuyến vòng tốt trước đó.
+# Chỉ dùng cho manual reroute, không đụng giao diện và không ép tuyến thường đi qua đây.
+_TS_REROUTE_ANCHORS = {
+    "dalat_center": (11.9404, 108.4583),
+    "mimosa_dalat": (11.8890, 108.5060),
+    "tuyen_lam": (11.8900, 108.4140),
+    "lien_khuong": (11.7500, 108.3730),
+    "duc_trong": (11.7350, 108.3730),
+    "di_linh": (11.5800, 108.0700),
+    "bao_loc": (11.5489, 107.8077),
+    "madaguoi": (11.3890, 107.5320),
+    "dau_giay": (10.9300, 107.2440),
+    "long_khanh": (10.9330, 107.2500),
+    "ba_ria": (10.4960, 107.1680),
+    "vung_tau": (10.4114, 107.1362),
+    "hcm_east": (10.8231, 106.8120),
+    "phan_thiet": (10.9333, 108.1000),
+    "phan_rang": (11.5639, 108.9880),
+    "nha_trang": (12.2388, 109.1967),
+}
+
+
+def _ts_destination_point(lat, lon, distance_km, bearing_deg):
+    """Tạo waypoint quanh sự cố theo bán kính + hướng, format trả về (lat, lon)."""
+    try:
+        R = 6371.0
+        brng = math.radians(float(bearing_deg))
+        d = float(distance_km) / R
+        lat1 = math.radians(float(lat))
+        lon1 = math.radians(float(lon))
+        lat2 = math.asin(
+            math.sin(lat1) * math.cos(d)
+            + math.cos(lat1) * math.sin(d) * math.cos(brng)
+        )
+        lon2 = lon1 + math.atan2(
+            math.sin(brng) * math.sin(d) * math.cos(lat1),
+            math.cos(d) - math.sin(lat1) * math.sin(lat2),
+        )
+        return (math.degrees(lat2), math.degrees(lon2))
+    except Exception:
+        return (lat, lon)
+
+
+def _ts_in_vn_bbox_light(lat, lon):
+    """Lọc thô để không gửi waypoint quá lệch ra ngoài vùng Việt Nam."""
+    try:
+        lat = float(lat); lon = float(lon)
+        return 8.18 <= lat <= 23.39 and 102.14 <= lon <= 109.47
+    except Exception:
+        return False
+
+
+def _ts_candidate_road_anchors(origin, dest, ilat, ilon, avoid_r):
+    """Chọn anchor gần sự cố/tuyến để OSRM snap vào đường thật thay vì rừng/hồ."""
+    out = []
+    try:
+        base_km = max(25.0, float(avoid_r or 3.0) * 8.0)
+        od_km = max(1.0, _haversine_km(origin[0], origin[1], dest[0], dest[1]))
+        for _name, pos in _TS_REROUTE_ANCHORS.items():
+            lat, lon = pos
+            d_inc = _haversine_km(float(ilat), float(ilon), lat, lon)
+            d_o = _haversine_km(origin[0], origin[1], lat, lon)
+            d_d = _haversine_km(dest[0], dest[1], lat, lon)
+            detour = (d_o + d_d) / od_km
+            if d_inc <= base_km and detour <= 1.85:
+                out.append((d_inc, detour, pos))
+        out.sort(key=lambda x: (x[1], x[0]))
+        return [x[2] for x in out[:10]]
+    except Exception:
+        return []
+
+
+def _ts_incident_clearance(polyline, ilat, ilon):
+    try:
+        return float(_min_distance_polyline_to_coord_km(polyline or [], ilat, ilon, sample_step=2) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ts_route_detour_ratio(old_route, new_route):
+    try:
+        old_km = float(_get_route_distance_km(old_route or {}) or _distance_km_from_polyline((old_route or {}).get("polyline") or []) or 0.0)
+        new_km = float(_get_route_distance_km(new_route or {}) or _distance_km_from_polyline((new_route or {}).get("polyline") or []) or 0.0)
+        if old_km <= 0 or new_km <= 0:
+            return 1.0
+        return new_km / old_km
+    except Exception:
+        return 1.0
+
+
+def _ts_add_reroute_candidate(candidates, seen, rt, source, waypoints, old_route, ilat, ilon, rr):
+    """Chuẩn hóa + chấm điểm một route ứng viên."""
+    try:
+        if not rt or rt.get("fallback") or rt.get("reroute_failed"):
+            return False
+        poly = rt.get("polyline") or []
+        if len(poly) < 2:
+            return False
+
+        # Signature mềm để bỏ trùng nhưng không loại nhầm các tuyến gần giống.
+        sig = _ts_route_signature(poly)
+        dist_km = float(_get_route_distance_km(rt) or _distance_km_from_polyline(poly) or 0.0)
+        sig2 = (sig, round(dist_km, 1), str(source))
+        if sig2 in seen:
+            return False
+        seen.add(sig2)
+
+        clearance = _ts_incident_clearance(poly, ilat, ilon)
+        detour = _ts_route_detour_ratio(old_route, rt)
+        changed = _ts_route_changed_enough(old_route, rt, ilat, ilon)
+        has_wp = bool(waypoints or rt.get("reroute_waypoints"))
+        direct_like = source == "direct_fallback" or (rt.get("reroute_source") == "direct_fallback" and not has_wp)
+
+        # Không nhận tuyến quá vòng, trừ khi nó né sự cố rõ ràng.
+        max_detour = 1.75 if float(rr or 0) <= 10 else 2.05
+        if detour > max_detour and clearance < max(float(rr or 0) * 0.9, 1.0):
+            return False
+
+        item = dict(rt)
+        item.update({
+            "rerouted": True,
+            "manual_incident_reroute": True,
+            "manual_avoid_radius_km": float(rr),
+            "manual_incident_clearance_km": clearance,
+            "incident_clearance_km": item.get("incident_clearance_km", round(clearance, 2)),
+            "reroute_source": item.get("reroute_source") or source,
+            "reroute_waypoints": item.get("reroute_waypoints") or list(waypoints or []),
+            "detour_ratio": round(detour, 3),
+            "hard_avoid": bool(clearance >= float(rr) * 0.95),
+            "soft_avoid": bool(clearance >= float(rr) * 0.55 or changed),
+            "label": f"🔄 Tuyến mới tránh sự cố ({float(rr):g} km)",
+        })
+
+        # Rank giống logic routing cũ: ưu tiên né tốt, có waypoint thật, không quá vòng.
+        score = 0.0
+        score += min(clearance / max(float(rr), 0.5), 2.5) * 120.0
+        score += 60.0 if item.get("hard_avoid") else 0.0
+        score += 35.0 if item.get("soft_avoid") else 0.0
+        score += 25.0 if has_wp else 0.0
+        score += 20.0 if changed else -60.0
+        score -= max(0.0, detour - 1.0) * 95.0
+        score -= 80.0 if direct_like else 0.0
+        item["__manual_reroute_rank"] = score
+        item["__manual_reroute_changed"] = changed
+        item["__manual_reroute_direct_like"] = direct_like
+        candidates.append(item)
+        return True
+    except Exception:
+        return False
+
+
+def _ts_find_best_incident_reroute(router, origin, dest, ilat, ilon, mode_r, avoid_r, old_route):
+    """
+    FAST ONE-CLICK REROUTE BY RANGE.
+
+    Yêu cầu mới:
+    - Bấm 1 lần là thử đủ candidate trong khoảng đã chọn.
+    - Có 3 mức:
+        1 km  -> thử tuyến vòng nhỏ trong vùng 1–5 km
+        5 km  -> thử tuyến vòng vừa trong vùng 5–20 km
+        20 km -> thử tuyến vòng xa, >20 km
+    - Không gọi router.reroute_around_incident() kiểu tuần tự lâu nữa.
+      Thay vào đó tự tạo waypoint quanh sự cố rồi gọi router.get_route() song song.
+    - Chọn tuyến NGẮN NHẤT trong các tuyến vòng hợp lệ.
+    - Vẫn thay luôn tuyến hiện tại, không mở map phụ.
+    """
+    import time as _time
+    import concurrent.futures as _futures
+
+    origin = (float(origin[0]), float(origin[1]))
+    dest = (float(dest[0]), float(dest[1]))
+    ilat = float(ilat)
+    ilon = float(ilon)
+
+    try:
+        level = float(avoid_r or 1.0)
+    except Exception:
+        level = 1.0
+
+    # Map mức chọn -> dải waypoint cần thử.
+    if level >= 20:
+        range_label = ">20 km"
+        waypoint_radii = [20.0, 26.0, 34.0, 45.0, 60.0]
+        min_clearance_km = 2.5
+        max_detour_ratio = 3.20
+        timeout_sec = 10.0
+        max_workers = 10
+    elif level >= 5:
+        range_label = "5–20 km"
+        waypoint_radii = [5.0, 7.5, 10.0, 14.0, 18.0, 20.0]
+        min_clearance_km = 1.2
+        max_detour_ratio = 2.45
+        timeout_sec = 8.0
+        max_workers = 10
+    else:
+        range_label = "1–5 km"
+        waypoint_radii = [1.0, 1.5, 2.2, 3.2, 4.2, 5.0]
+        min_clearance_km = 0.45
+        max_detour_ratio = 1.85
+        timeout_sec = 6.5
+        max_workers = 8
+
+    old_poly = (old_route or {}).get("polyline") or []
+    old_km = float(
+        _get_route_distance_km(old_route or {})
+        or _distance_km_from_polyline(old_poly)
+        or 0.0
+    )
+    old_clearance = _ts_incident_clearance(old_poly, ilat, ilon) if old_poly else 0.0
+
+    # Nếu tuyến cũ vốn đi sát điểm sự cố, yêu cầu tuyến mới phải thoát khỏi khu vực.
+    # Nếu tuyến cũ đã xa, vẫn yêu cầu tuyến mới có waypoint và khác tuyến cũ.
+    required_clearance = max(min_clearance_km, min(old_clearance + 0.25, min_clearance_km + 0.8))
+
+    def _route_distance(rt):
+        return float(
+            _get_route_distance_km(rt or {})
+            or _distance_km_from_polyline((rt or {}).get("polyline") or [])
+            or 0.0
+        )
+
+    def _route_duration(rt):
+        try:
+            return float((rt or {}).get("duration_min") or 999999.0)
+        except Exception:
+            return 999999.0
+
+    def _candidate_from_route(rt, source, waypoints, radius_used):
+        """Chuẩn hóa candidate và lọc tuyến đi qua vùng chỉ định."""
+        try:
+            if not rt or rt.get("fallback") or rt.get("reroute_failed"):
+                return None
+            poly = rt.get("polyline") or []
+            if len(poly) < 2:
+                return None
+
+            dist_km = _route_distance(rt)
+            if old_km > 0 and dist_km > old_km * max_detour_ratio:
+                return None
+
+            clearance = _ts_incident_clearance(poly, ilat, ilon)
+            if clearance < required_clearance:
+                return None
+
+            changed = _ts_route_changed_enough(old_route, rt, ilat, ilon)
+            has_wp = bool(waypoints or rt.get("reroute_waypoints"))
+            if old_clearance < required_clearance and not changed and not has_wp:
+                return None
+
+            item = dict(rt)
+            item.update({
+                "rerouted": True,
+                "manual_incident_reroute": True,
+                "manual_avoid_radius_km": float(radius_used),
+                "manual_avoid_range_label": range_label,
+                "manual_incident_clearance_km": float(clearance),
+                "incident_clearance_km": round(float(clearance), 3),
+                "reroute_source": source,
+                "reroute_waypoints": list(waypoints or []),
+                "detour_ratio": round(dist_km / max(old_km, 1.0), 3) if old_km else 1.0,
+                "hard_avoid": True,
+                "soft_avoid": True,
+                "label": f"🔄 Tuyến vòng {range_label} ngắn nhất",
+                "__manual_reroute_changed": changed,
+                "__manual_reroute_direct_like": False,
+            })
+            return item
+        except Exception:
+            return None
+
+    # Tạo candidate theo cách rẻ: 1 waypoint vòng quanh điểm sự cố, một số cung 2 waypoint,
+    # và anchor đường thật gần khu vực.
+    jobs = []
+    bearings = (0, 45, 90, 135, 180, 225, 270, 315)
+
+    for radius in waypoint_radii:
+        for bearing in bearings:
+            wp = _ts_destination_point(ilat, ilon, radius, bearing)
+            if _ts_in_vn_bbox_light(wp[0], wp[1]):
+                jobs.append(("single", radius, [wp]))
+
+    # Arc 2 waypoint: ép tuyến vòng sang một phía, thường hiệu quả hơn 1 waypoint.
+    for radius in waypoint_radii[:4]:
+        for b1, b2 in ((45, 90), (90, 135), (225, 270), (270, 315), (0, 45), (180, 225)):
+            wp1 = _ts_destination_point(ilat, ilon, radius, b1)
+            wp2 = _ts_destination_point(ilat, ilon, radius, b2)
+            if _ts_in_vn_bbox_light(wp1[0], wp1[1]) and _ts_in_vn_bbox_light(wp2[0], wp2[1]):
+                jobs.append(("arc", radius, [wp1, wp2]))
+
+    # Anchor đường thật: dùng ít để tăng xác suất snap vào đường thật nhưng không kéo dài thời gian.
+    try:
+        anchors = _ts_candidate_road_anchors(origin, dest, ilat, ilon, max(3.0, min(20.0, level)))[:8]
+        for anchor in anchors:
+            # Chỉ dùng anchor phù hợp với khoảng đã chọn theo khoảng cách từ sự cố đến anchor.
+            d_anchor = _haversine_km(anchor[0], anchor[1], ilat, ilon)
+            if level < 5 and d_anchor <= 8:
+                jobs.append(("anchor", d_anchor, [anchor]))
+            elif 5 <= level < 20 and 4 <= d_anchor <= 28:
+                jobs.append(("anchor", d_anchor, [anchor]))
+            elif level >= 20 and d_anchor >= 12:
+                jobs.append(("anchor", d_anchor, [anchor]))
+    except Exception:
+        pass
+
+    # Ưu tiên thử bán kính nhỏ trước để dễ ra tuyến ngắn nhất.
+    jobs.sort(key=lambda j: (float(j[1]), 0 if j[0] == "single" else 1 if j[0] == "arc" else 2))
+
+    # Giới hạn số request, tránh tình trạng đợi quá lâu.
+    jobs = jobs[:70]
+
+    def _run_job(job):
+        kind, radius, wps = job
+        try:
+            rt = router.get_route(origin, dest, mode=mode_r, waypoints=wps)
+            return _candidate_from_route(rt, kind, wps, radius)
+        except Exception as e:
+            return ("ERR", f"{kind}/{radius:g}: {e}")
+
+    valid = []
+    errors = []
+    started = _time.time()
+
+    # Chạy song song: 1 lần bấm sẽ thử đủ candidate, không cần bấm đi bấm lại.
+    executor = _futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures = [executor.submit(_run_job, job) for job in jobs]
+
+    try:
+        for fut in _futures.as_completed(futures, timeout=timeout_sec):
+            remain = timeout_sec - (_time.time() - started)
+            if remain <= 0:
+                break
+            try:
+                res = fut.result(timeout=max(0.01, remain))
+                if isinstance(res, tuple) and res and res[0] == "ERR":
+                    errors.append(res[1])
+                    continue
+                if res:
+                    valid.append(res)
+
+                    # Early stop: đã có vài tuyến rất ngắn trong đúng range,
+                    # không cần chờ hết tất cả request.
+                    if len(valid) >= 4:
+                        best_now = min(valid, key=lambda r: (_route_distance(r), _route_duration(r)))
+                        if old_km <= 0 or _route_distance(best_now) <= old_km * 1.15:
+                            break
+            except Exception as e:
+                errors.append(str(e))
+    except Exception:
+        pass
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    if not valid:
+        return None, (
+            f"Chưa tìm được tuyến vòng trong khoảng {range_label} sau khoảng {timeout_sec:g}s. "
+            "Hãy chọn khoảng lớn hơn hoặc kiểm tra lại vị trí sự cố. "
+            "Nếu khu vực chỉ có một trục đường thì không thể tạo tuyến vòng thật."
+        )
+
+    # Chọn tuyến NGẮN NHẤT trong các tuyến vòng hợp lệ.
+    valid.sort(key=lambda rt: (_route_distance(rt), _route_duration(rt)))
+    best = valid[0]
+    _apply_avg_speed_timing(best, mode_r)
+
+    best_dist = _route_distance(best)
+    clearance = float(best.get("manual_incident_clearance_km") or 0.0)
+    detour = float(best.get("detour_ratio") or (best_dist / max(old_km, 1.0)))
+    elapsed = _time.time() - started
+
+    return best, (
+        f"Đã chọn tuyến vòng ngắn nhất trong khoảng {range_label}; "
+        f"tìm thấy {len(valid)} tuyến hợp lệ sau {elapsed:.1f}s, "
+        f"cách khu vực chỉ định khoảng {clearance:.1f} km, "
+        f"quãng đường {best_dist:.1f} km, độ vòng {detour:.2f}x."
+    )
+
+
+def _ts_apply_manual_incident_reroute_to_session(new_rt, origin, dest, mode_r, ilat, ilon, avoid_r):
+    """
+    Áp dụng tuyến vòng vào tuyến chính.
+    Đây là phần thiếu khiến trước đó bấm 'Tính tuyến vòng' chỉ hiện map phụ,
+    còn bản đồ chính/route state không đổi.
+    """
+    try:
+        if not new_rt or not new_rt.get("polyline"):
+            return False, "Không có polyline tuyến vòng để áp dụng."
+
+        ss = st.session_state
+        new_rt = dict(new_rt)
+        poly = new_rt.get("polyline") or []
+
+        # Route chính: tuyến mới THAY tuyến hiện tại, không tạo map/tuyến phụ.
+        ss["last_routes"] = [new_rt]
+        ss["last_selected"] = 0
+        ss["selected_route_idx"] = 0
+        ss["last_origin"] = origin
+        ss["last_dest"] = dest
+        ss["last_mode"] = mode_r
+        ss["last_incident_reroute"] = new_rt
+        ss["last_polyline"] = poly
+        ss["last_route_km"] = _get_route_distance_km(new_rt)
+
+        # Nếu đang GPS/live navigation, cho map chính dùng ngay polyline mới.
+        ss["nav_polyline"] = poly
+        ss["nav_steps"] = new_rt.get("steps", ss.get("nav_steps", []))
+        ss["nav_progress_idx"] = 0
+        ss["nav_max_progress"] = 0
+        ss["nav_offroute"] = False
+        ss["nav_reroute_pl"] = None
+        ss["nav_dest"] = dest
+        ss["nav_mode"] = mode_r
+        ss["nav_distance_left_osrm"] = _get_route_distance_km(new_rt)
+
+        # Xóa toàn bộ cache/phân tích tuyến cũ để UI buộc tính lại.
+        for k in [
+            "last_compared", "route_view_cache", "route_view_cache_key",
+            "last_route_risk_forecast", "last_danger_markers", "last_rest_stops",
+            "auto_eta_forecast", "copilot_critical_segment",
+            "last_route_fuel_stations_all", "last_route_fuel_stations",
+            "next_fuel_stations", "last_route_fuel_key", "__active_fuel_route_key",
+            "__fuel_fetch_future", "__fuel_fetch_key",
+            "last_incident_preview_route", "manual_reroute_preview_html",
+            "reroute_html", "reroute_preview", "new_rt_preview",
+        ]:
+            ss.pop(k, None)
+
+        try:
+            if isinstance(ss.get("__fuel_route_cache"), dict):
+                ss["__fuel_route_cache"] = {}
+        except Exception:
+            pass
+
+        try:
+            _clear_route_view_cache()
+        except Exception:
+            pass
+
+        # Lưu trạng thái để chuyển tab/quay lại vẫn giữ tuyến vòng.
+        try:
+            _backup_trip_route_state("manual_incident_reroute_applied")
+        except Exception:
+            pass
+        try:
+            _persist_current_route_snapshot()
+        except Exception:
+            pass
+
+        ss["manual_reroute_applied_msg"] = (
+            f"✅ Đã thay tuyến hiện tại bằng tuyến tránh sự cố "
+            f"(bán kính {float(new_rt.get('manual_avoid_radius_km') or avoid_r):g} km)."
+        )
+        return True, ss["manual_reroute_applied_msg"]
+    except Exception as e:
+        return False, f"Lỗi áp dụng tuyến vòng: {e}"
+
+
+
 def resolve_location(txt, maps_api):
     """Dùng cho các tab không cần chọn (thời tiết, sơ tán, v.v.)."""
     if not txt: return None, None
@@ -651,9 +1216,724 @@ def _inject_accessible_ui_css():
     """, unsafe_allow_html=True)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NON-BLOCKING FUEL FETCH
+# ─────────────────────────────────────────────────────────────────────────────
+def _fuel_route_cache_key(polyline, corridor_m=800, max_results=80):
+    """Cache key ổn định theo tuyến gốc, không phụ thuộc GPS/nav_active."""
+    try:
+        import hashlib, json as _json
+        pts = polyline or []
+        if not pts:
+            return "empty"
+        step = max(1, int(len(pts) / 80))
+        sample = []
+        for p in pts[::step]:
+            try:
+                sample.append([round(float(p[0]), 5), round(float(p[1]), 5)])
+            except Exception:
+                pass
+        if pts and sample[-1] != [round(float(pts[-1][0]), 5), round(float(pts[-1][1]), 5)]:
+            sample.append([round(float(pts[-1][0]), 5), round(float(pts[-1][1]), 5)])
+        raw = _json.dumps({"pts": sample, "corridor_m": int(corridor_m), "max_results": int(max_results)}, separators=(",", ":"))
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    except Exception:
+        return f"fuel_{len(polyline or [])}_{corridor_m}_{max_results}"
+
+@st.cache_resource
+def _fuel_fetch_executor():
+    import concurrent.futures
+    return concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+def _get_fuel_stations_nonblocking(poi_engine, polyline, corridor_m=300, max_results=20, wait_sec=4.0):
+    """
+    Lấy cây xăng không chặn UI, cache theo TỪNG TUYẾN.
+
+    FINAL FIX:
+    - Tuyệt đối không dùng last_route_fuel_stations_all của tuyến cũ cho tuyến mới.
+    - Khi route_key đổi, xóa dữ liệu cây xăng tạm của tuyến trước.
+    - Nếu Overpass chưa trả kết quả cho tuyến mới, trả [] để fallback tạo marker mới theo polyline mới.
+    """
+    import concurrent.futures
+    ss = st.session_state
+    if not polyline:
+        return []
+
+    key = _fuel_route_cache_key(polyline, corridor_m=corridor_m, max_results=max_results)
+    prev_key = ss.get("last_route_fuel_key")
+
+    # Route đổi: không giữ cây xăng cũ, không giữ future cũ.
+    if prev_key and prev_key != key:
+        ss.pop("last_route_fuel_stations_all", None)
+        ss.pop("last_route_fuel_stations", None)
+        ss.pop("next_fuel_stations", None)
+        ss["fuel_along_route_count"] = 0
+        if ss.get("__fuel_fetch_key") != key:
+            ss["__fuel_fetch_future"] = None
+            ss["__fuel_fetch_key"] = None
+
+    ss["__active_fuel_route_key"] = key
+
+    cache = ss.setdefault("__fuel_route_cache", {})
+    if isinstance(cache, dict) and key in cache:
+        fuels = cache.get(key) or []
+        ss["last_route_fuel_key"] = key
+        if fuels:
+            ss["last_route_fuel_stations_all"] = fuels
+        return fuels
+
+    fut = ss.get("__fuel_fetch_future")
+    fut_key = ss.get("__fuel_fetch_key")
+
+    # Nếu đang có future của tuyến hiện tại, chỉ dùng kết quả của chính tuyến này.
+    if fut is not None and fut_key == key:
+        try:
+            if fut.done():
+                fuels = fut.result() or []
+                cache[key] = fuels
+                ss["__fuel_route_cache"] = cache
+                ss["__fuel_fetch_future"] = None
+                ss["last_route_fuel_key"] = key
+                if fuels:
+                    ss["last_route_fuel_stations_all"] = fuels
+                return fuels
+
+            # Chưa xong: chỉ trả cache tạm nếu đúng route_key.
+            if ss.get("last_route_fuel_key") == key:
+                return ss.get("last_route_fuel_stations_all", [])
+            return []
+        except Exception as e:
+            ss["fuel_along_route_error"] = str(e)
+            ss["__fuel_fetch_future"] = None
+            if ss.get("last_route_fuel_key") == key:
+                return ss.get("last_route_fuel_stations_all", [])
+            return []
+
+    # Nếu có future tuyến cũ, bỏ qua để không làm lẫn dữ liệu.
+    if fut is not None and fut_key != key:
+        ss["__fuel_fetch_future"] = None
+        ss["__fuel_fetch_key"] = None
+
+    # Submit future mới cho đúng tuyến hiện tại.
+    poly_copy = [[float(p[0]), float(p[1])] for p in (polyline or []) if len(p) >= 2]
+    def _fetch():
+        return poi_engine.get_fuel_stations_on_route(
+            poly_copy,
+            corridor_m=int(corridor_m),
+            max_results=int(max_results),
+            current_position=None,   # cây xăng toàn tuyến không phụ thuộc GPS
+            only_upcoming=False,
+        )
+
+    try:
+        fut = _fuel_fetch_executor().submit(_fetch)
+        ss["__fuel_fetch_future"] = fut
+        ss["__fuel_fetch_key"] = key
+        ss["last_route_fuel_key"] = key
+        try:
+            fuels = fut.result(timeout=float(wait_sec))
+            fuels = fuels or []
+            cache[key] = fuels
+            ss["__fuel_route_cache"] = cache
+            ss["__fuel_fetch_future"] = None
+            ss["last_route_fuel_key"] = key
+            if fuels:
+                ss["last_route_fuel_stations_all"] = fuels
+            return fuels
+        except concurrent.futures.TimeoutError:
+            ss["fuel_along_route_pending"] = True
+            # Không dùng dữ liệu cũ. Tuyến mới chưa có kết quả thì fallback sẽ sinh theo polyline mới.
+            return ss.get("last_route_fuel_stations_all", []) if ss.get("last_route_fuel_key") == key else []
+    except Exception as e:
+        ss["fuel_along_route_error"] = str(e)
+        return ss.get("last_route_fuel_stations_all", []) if ss.get("last_route_fuel_key") == key else []
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GUARANTEED FUEL VISIBILITY LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+def _ts_get_fuel_lat_lon(item):
+    """Đọc lat/lon linh hoạt từ nhiều format POI khác nhau."""
+    try:
+        if not isinstance(item, dict):
+            return None, None
+        lat = item.get("lat", item.get("latitude", item.get("center_lat")))
+        lon = item.get("lon", item.get("lng", item.get("longitude", item.get("center_lon"))))
+        if lat is None and isinstance(item.get("location"), dict):
+            lat = item["location"].get("lat")
+            lon = item["location"].get("lon", item["location"].get("lng"))
+        if lat is None or lon is None:
+            return None, None
+        return float(lat), float(lon)
+    except Exception:
+        return None, None
+
+
+def _ts_normalize_fuel_marker(item, idx=1, fallback=False):
+    """Chuẩn hóa cây xăng để cả make_full_map và lớp JS đều nhận ra."""
+    try:
+        item = dict(item or {})
+        lat, lon = _ts_get_fuel_lat_lon(item)
+        if lat is None or lon is None:
+            return None
+
+        name = (
+            item.get("name")
+            or item.get("brand")
+            or item.get("operator")
+            or item.get("label")
+            or ("Điểm kiểm tra nhiên liệu" if fallback else "Cây xăng")
+        )
+        out = dict(item)
+        out.update({
+            "lat": float(lat),
+            "lon": float(lon),
+            "lng": float(lon),
+            "name": str(name),
+            "label": str(name),
+            "type": "fuel",
+            "category": "fuel",
+            "kind": "fuel",
+            "amenity": "fuel",
+            "icon": "⛽",
+            "emoji": "⛽",
+            "is_fuel": True,
+            "fuel": True,
+            "fallback": bool(fallback or item.get("fallback")),
+            "verified": not bool(fallback or item.get("fallback")),
+        })
+        if out.get("route_km") is None:
+            out["route_km"] = item.get("km", idx * 1.0)
+        if out.get("dist_from_route_m") is None:
+            out["dist_from_route_m"] = item.get("distance_m", 0 if fallback else item.get("dist_from_route_m"))
+        return out
+    except Exception:
+        return None
+
+
+
+def _ts_nearest_route_km_for_marker(polyline, lat, lon):
+    """Tính km gần nhất trên tuyến cho marker nhiên liệu."""
+    try:
+        pts = polyline or []
+        if not pts:
+            return 0.0
+        lat = float(lat); lon = float(lon)
+        best_d = 999999.0
+        best_km = 0.0
+        km = 0.0
+        prev = None
+        step = max(1, int(len(pts) / 900))
+        sampled = list(range(0, len(pts), step))
+        if sampled[-1] != len(pts) - 1:
+            sampled.append(len(pts) - 1)
+
+        # cumulative xấp xỉ theo sample đủ nhẹ cho Streamlit.
+        last_idx = sampled[0]
+        last_pt = pts[last_idx]
+        km_at_idx = {last_idx: 0.0}
+        running = 0.0
+        for idx in sampled[1:]:
+            p = pts[idx]
+            try:
+                running += _haversine_km(float(last_pt[1]), float(last_pt[0]), float(p[1]), float(p[0]))
+            except Exception:
+                pass
+            km_at_idx[idx] = running
+            last_pt = p
+
+        for idx in sampled:
+            p = pts[idx]
+            try:
+                d = _haversine_km(lat, lon, float(p[1]), float(p[0]))
+                if d < best_d:
+                    best_d = d
+                    best_km = km_at_idx.get(idx, 0.0)
+            except Exception:
+                pass
+        return float(best_km)
+    except Exception:
+        return 0.0
+
+
+def _ts_enrich_fuel_route_km(fuels, polyline):
+    """Bổ sung route_km thật cho cây xăng nếu POIEngine thiếu hoặc route_km sai."""
+    out = []
+    for i, f in enumerate(fuels or [], 1):
+        nf = _ts_normalize_fuel_marker(f, i, fallback=bool((f or {}).get("fallback")) if isinstance(f, dict) else False)
+        if not nf:
+            continue
+        try:
+            lat, lon = _ts_get_fuel_lat_lon(nf)
+            rk = nf.get("route_km")
+            # route_km từ một số nguồn có thể là idx * 1.0, không phản ánh vị trí thật.
+            # Tính lại theo polyline để phân bố đúng trên toàn tuyến.
+            real_km = _ts_nearest_route_km_for_marker(polyline, lat, lon)
+            if real_km is not None:
+                nf["route_km"] = float(real_km)
+        except Exception:
+            pass
+        out.append(nf)
+    return out
+
+
+def _ts_spread_fuel_markers_across_route(fuels, polyline, max_results=24):
+    """
+    Không lấy cleaned[:N] nữa vì như vậy toàn bộ cây xăng dễ bị dồn ở đầu tuyến.
+    Hàm này chọn marker rải theo route_km trên toàn tuyến.
+    """
+    try:
+        fuels = _ts_enrich_fuel_route_km(fuels, polyline)
+        if not fuels:
+            return []
+        total_km = float(_distance_km_from_polyline(polyline) or 0.0)
+        fuels.sort(key=lambda x: float(x.get("route_km") or 0.0))
+
+        # Khử trùng lặp quá gần nhau.
+        deduped = []
+        for f in fuels:
+            rk = float(f.get("route_km") or 0.0)
+            if not deduped or abs(rk - float(deduped[-1].get("route_km") or 0.0)) >= 0.8:
+                deduped.append(f)
+
+        if len(deduped) <= int(max_results):
+            return deduped
+
+        # Chia route thành các bucket và lấy 1 cây tốt nhất mỗi bucket.
+        bucket_count = min(int(max_results), 24)
+        if total_km <= 0:
+            return deduped[:bucket_count]
+
+        buckets = [[] for _ in range(bucket_count)]
+        for f in deduped:
+            rk = max(0.0, min(total_km, float(f.get("route_km") or 0.0)))
+            bi = min(bucket_count - 1, int((rk / max(total_km, 0.001)) * bucket_count))
+            buckets[bi].append(f)
+
+        selected = []
+        for b in buckets:
+            if not b:
+                continue
+            # Ưu tiên cây thật, gần trung tâm bucket.
+            selected.append(sorted(b, key=lambda x: (bool(x.get("fallback")), float(x.get("dist_from_route_m") or 0.0)))[0])
+
+        # Nếu còn thiếu slot, fill theo thứ tự tuyến.
+        selected_ids = {id(x) for x in selected}
+        for f in deduped:
+            if len(selected) >= bucket_count:
+                break
+            if id(f) not in selected_ids:
+                selected.append(f)
+                selected_ids.add(id(f))
+
+        selected.sort(key=lambda x: float(x.get("route_km") or 0.0))
+        return selected[:bucket_count]
+    except Exception:
+        return (fuels or [])[:max_results]
+
+
+def _ts_add_fallback_fuel_gaps_if_needed(selected, polyline, max_results=24):
+    """
+    Nếu dữ liệu thật chỉ nằm ở đầu tuyến, thêm điểm kiểm tra nhiên liệu ở đoạn sau.
+    Không giả mạo là cây xăng thật: marker fallback vẫn ghi rõ 'chưa xác minh'.
+    """
+    try:
+        selected = list(selected or [])
+        total_km = float(_distance_km_from_polyline(polyline) or 0.0)
+        if total_km <= 40 or len(selected) >= int(max_results):
+            return selected
+
+        real_points = [f for f in selected if not f.get("fallback")]
+        last_real_km = max([float(f.get("route_km") or 0.0) for f in real_points], default=0.0)
+
+        # Nếu cây xăng thật chỉ phủ đoạn đầu, thêm fallback ở đoạn giữa/cuối.
+        if last_real_km >= total_km * 0.70:
+            return selected
+
+        gaps = _ts_route_fuel_fallbacks(polyline, max_results=8)
+        for g in gaps:
+            if len(selected) >= int(max_results):
+                break
+            try:
+                gkm = float(g.get("route_km") or 0.0)
+                if gkm <= last_real_km + 12.0:
+                    continue
+                if any(abs(gkm - float(f.get("route_km") or 0.0)) < 8.0 for f in selected):
+                    continue
+                selected.append(g)
+            except Exception:
+                pass
+
+        selected.sort(key=lambda x: float(x.get("route_km") or 0.0))
+        return selected[:int(max_results)]
+    except Exception:
+        return selected
+
+
+def _ts_current_route_km_from_gps(polyline, current_position):
+    """
+    Tính vị trí GPS hiện tại theo km trên tuyến.
+    Dùng để biết cây xăng nào đã đi qua.
+    """
+    try:
+        if not polyline or not current_position:
+            return None
+        lat, lon = float(current_position[0]), float(current_position[1])
+        return float(_ts_nearest_route_km_for_marker(polyline, lat, lon))
+    except Exception:
+        return None
+
+
+def _ts_next_fuel_after_gps_progress(fuel_stations, polyline, current_position=None, max_results=2, passed_margin_km=0.30):
+    """
+    Lọc cây xăng phía trước theo GPS:
+    - Khi GPS vượt quá route_km của cây xăng khoảng 300m, cây đó bị loại.
+    - Cây tiếp theo tự lên đầu danh sách.
+    - Không phụ thuộc vào poi_engine.get_next_fuel_stations() nữa vì hàm đó dễ giữ cây cũ.
+    """
+    try:
+        fuels = _ts_enrich_fuel_route_km(fuel_stations or [], polyline)
+        fuels = [f for f in fuels if f]
+        fuels.sort(key=lambda x: float(x.get("route_km") or 0.0))
+
+        if not fuels:
+            st.session_state["fuel_current_route_km"] = None
+            return []
+
+        cur_km = _ts_current_route_km_from_gps(polyline, current_position)
+        st.session_state["fuel_current_route_km"] = cur_km
+
+        if cur_km is None:
+            out = fuels[:int(max_results)]
+            st.session_state["next_fuel_stations"] = out
+            return out
+
+        # Cây xăng được coi là đã qua nếu nó nằm sau lưng GPS quá passed_margin_km.
+        ahead = []
+        passed = []
+        for f in fuels:
+            rk = float(f.get("route_km") or 0.0)
+            if rk >= float(cur_km) + float(passed_margin_km):
+                ahead.append(f)
+            else:
+                passed.append(f)
+
+        st.session_state["fuel_passed_count"] = len(passed)
+        st.session_state["fuel_next_update_note"] = (
+            f"GPS km {float(cur_km):.1f}; đã bỏ qua {len(passed)} điểm nhiên liệu phía sau."
+        )
+
+        out = ahead[:int(max_results)]
+        st.session_state["next_fuel_stations"] = out
+        return out
+    except Exception as e:
+        st.session_state["fuel_next_update_error"] = str(e)
+        out = (fuel_stations or [])[:int(max_results)]
+        st.session_state["next_fuel_stations"] = out
+        return out
+
+
+
+
+def _ts_route_fuel_fallbacks(polyline, max_results=6):
+    """
+    Fallback 100% hiển thị marker nhiên liệu nếu OSM/Overpass không trả dữ liệu.
+    Đây là điểm nhắc kiểm tra nhiên liệu trên tuyến, KHÔNG giả mạo là cây xăng thật.
+    """
+    out = []
+    try:
+        if not polyline or len(polyline) < 2:
+            return out
+        total_km = float(_distance_km_from_polyline(polyline) or 0.0)
+        if total_km <= 0:
+            return out
+
+        if total_km < 30:
+            kms = [max(1.0, total_km * 0.5)]
+        else:
+            step = 35.0
+            first = min(18.0, max(6.0, total_km * 0.18))
+            kms = []
+            k = first
+            while k < max(5.0, total_km - 5.0) and len(kms) < int(max_results):
+                kms.append(k)
+                k += step
+            if not kms:
+                kms = [max(1.0, total_km * 0.5)]
+
+        for i, km in enumerate(kms[:max_results], 1):
+            try:
+                lat, lon = _coord_at_route_km(polyline, km)
+                if lat is None or lon is None:
+                    continue
+                out.append(_ts_normalize_fuel_marker({
+                    "lat": lat,
+                    "lon": lon,
+                    "name": f"Điểm kiểm tra nhiên liệu {i}",
+                    "label": "Điểm kiểm tra nhiên liệu",
+                    "route_km": float(km),
+                    "desc": "Dữ liệu cây xăng thực chưa tải được; đây là điểm nhắc kiểm tra nhiên liệu trên tuyến.",
+                    "note": "fallback_unverified",
+                }, idx=i, fallback=True))
+            except Exception:
+                continue
+        return [x for x in out if x]
+    except Exception:
+        return []
+
+
+def _ts_ensure_visible_fuel_markers(fuel_stations, polyline, max_results=24):
+    """
+    Luôn trả về marker nhiên liệu rải trên TOÀN TUYẾN:
+    - Ưu tiên cây xăng thật từ POI/Overpass.
+    - Không cắt cleaned[:N] nữa vì nó làm cây xăng bị dồn ở đoạn đầu.
+    - Nếu dữ liệu thật chỉ có ở đoạn đầu, thêm điểm kiểm tra nhiên liệu fallback ở đoạn sau.
+    """
+    cleaned = []
+    try:
+        for i, f in enumerate(fuel_stations or [], 1):
+            nf = _ts_normalize_fuel_marker(f, i, fallback=bool((f or {}).get("fallback")) if isinstance(f, dict) else False)
+            if nf:
+                cleaned.append(nf)
+    except Exception:
+        cleaned = []
+
+    if cleaned:
+        spread = _ts_spread_fuel_markers_across_route(cleaned, polyline, max_results=max_results)
+        spread = _ts_add_fallback_fuel_gaps_if_needed(spread, polyline, max_results=max_results)
+        return spread[:max_results], False
+
+    fallback = _ts_route_fuel_fallbacks(polyline, max_results=min(max_results, 8))
+    return fallback, True
+
+
+def _ts_inject_fuel_markers_html(map_html, fuel_markers):
+    """
+    Thêm một lớp marker ⛽ bằng JS trực tiếp vào Folium HTML.
+    Như vậy dù ui.streamlit_map.py không nhận format POI, marker vẫn hiện.
+    """
+    try:
+        if not map_html or not fuel_markers:
+            return map_html
+
+        import json as _json
+        import re as _re
+
+        markers = []
+        for i, f in enumerate(fuel_markers or [], 1):
+            try:
+                lat, lon = _ts_get_fuel_lat_lon(f)
+                if lat is None or lon is None:
+                    continue
+                markers.append({
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "name": str(f.get("name") or f.get("label") or f"Cây xăng {i}"),
+                    "route_km": float(f.get("route_km") or 0.0),
+                    "fallback": bool(f.get("fallback")),
+                    "verified": bool(f.get("verified", not f.get("fallback"))),
+                    "operator": str(f.get("operator") or f.get("brand") or ""),
+                    "dist_m": f.get("dist_from_route_m"),
+                    "desc": str(f.get("desc") or ""),
+                })
+            except Exception:
+                continue
+
+        if not markers:
+            return map_html
+
+        m = _re.search(r"var\s+(map_[A-Za-z0-9_]+)\s*=\s*L\.map", map_html)
+        map_var = m.group(1) if m else ""
+
+        payload = _json.dumps(markers, ensure_ascii=False)
+        map_ref_expr = (
+            f'(typeof {map_var} !== "undefined" ? {map_var} : (window["{map_var}"] || findLeafletMap()))'
+            if map_var else "findLeafletMap()"
+        )
+
+        js = f"""
+<script>
+(function() {{
+  const FUEL_MARKERS = {payload};
+  const ROUTE_FUEL_KEY = FUEL_MARKERS.map(f => `${Number(f.lat).toFixed(4)},${Number(f.lon).toFixed(4)}`).join("|");
+  const LAYER_KEY = "__tripsmartGuaranteedFuelLayer_" + ROUTE_FUEL_KEY;
+
+  function esc(s) {{
+    return String(s || "").replace(/[&<>"']/g, function(c) {{
+      return ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\\\\\"":"&quot;","'":"&#39;"}})[c] || c;
+    }});
+  }}
+
+  function findLeafletMap() {{
+    try {{
+      for (const k of Object.keys(window)) {{
+        const v = window[k];
+        if (v && window.L && v instanceof L.Map) return v;
+      }}
+    }} catch(e) {{}}
+    try {{
+      const el = document.querySelector(".folium-map, .leaflet-container");
+      if (el) {{
+        for (const k of Object.keys(window)) {{
+          const v = window[k];
+          if (v && v._container === el) return v;
+        }}
+      }}
+    }} catch(e) {{}}
+    return null;
+  }}
+
+  function fuelIcon(isFallback) {{
+    const bg = isFallback ? "#f59e0b" : "#ef4444";
+    const border = isFallback ? "#fff7ed" : "#ffffff";
+    return L.divIcon({{
+      html: `<div style="width:30px;height:30px;border-radius:50%;background:${{bg}};border:3px solid ${{border}};display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,.35);font-size:16px;color:white;">⛽</div>`,
+      className: "tripsmart-guaranteed-fuel-icon",
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+      popupAnchor: [0, -15]
+    }});
+  }}
+
+  function addFuelLayer() {{
+    if (!window.L) return;
+    const map = {map_ref_expr};
+    if (!map) return;
+
+    if (window[LAYER_KEY]) {{
+      try {{ map.removeLayer(window[LAYER_KEY]); }} catch(e) {{}}
+    }}
+
+    const layer = L.layerGroup();
+    let realCount = 0;
+    let fallbackCount = 0;
+
+    for (const f of FUEL_MARKERS) {{
+      if (!Number.isFinite(f.lat) || !Number.isFinite(f.lon)) continue;
+      if (f.fallback) fallbackCount += 1; else realCount += 1;
+      const title = f.fallback ? "Điểm kiểm tra nhiên liệu" : (f.name || "Cây xăng");
+      const km = f.route_km ? `km ${{Number(f.route_km).toFixed(1)}}` : "";
+      const warn = f.fallback
+        ? `<div style="margin-top:6px;color:#92400e"><b>Chưa xác minh:</b> OSM/Overpass chưa trả cây xăng thật, đây là điểm nhắc kiểm tra nhiên liệu.</div>`
+        : `<div style="margin-top:6px;color:#166534">Dữ liệu cây xăng từ POI/OSM nếu có.</div>`;
+      const popup = `
+        <div style="min-width:210px">
+          <b>⛽ ${{esc(title)}}</b><br>
+          <span>${{esc(km)}}</span>
+          ${{f.operator ? `<br><span>Đơn vị: ${{esc(f.operator)}}</span>` : ""}}
+          ${{warn}}
+        </div>`;
+      L.marker([f.lat, f.lon], {{
+        icon: fuelIcon(!!f.fallback),
+        zIndexOffset: 1200,
+        title: title
+      }}).bindPopup(popup).addTo(layer);
+    }}
+
+    layer.addTo(map);
+    window[LAYER_KEY] = layer;
+
+    try {{
+      const box = document.querySelector(".leaflet-top.leaflet-left");
+      if (box && !document.querySelector(".ts-fuel-status-control")) {{
+        const div = L.DomUtil.create("div", "leaflet-control ts-fuel-status-control");
+        div.style.cssText = "background:rgba(255,255,255,.92);padding:8px 10px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.22);font:600 12px system-ui;line-height:1.35;max-width:260px;";
+        div.innerHTML = realCount
+          ? `⛽ <b>Cây xăng dọc tuyến</b><br>Đã hiển thị ${{realCount}} điểm.`
+          : `⛽ <b>Điểm nhiên liệu dự phòng</b><br>Chưa có dữ liệu OSM; đã hiển thị điểm nhắc kiểm tra.`;
+        box.appendChild(div);
+      }}
+    }} catch(e) {{}}
+  }}
+
+  setTimeout(addFuelLayer, 250);
+  setTimeout(addFuelLayer, 1200);
+}})();
+</script>
+"""
+        if "</body>" in map_html:
+            return map_html.replace("</body>", js + "\n</body>")
+        return map_html + js
+    except Exception:
+        return map_html
+
+
+
+def _backup_trip_route_state(reason: str = ""):
+    """
+    Lưu route + cache phân tích ngay trong session_state.
+
+    Lý do cần thêm lớp backup này:
+    - Streamlit rerun toàn app khi đổi sidebar/menu/tab.
+    - Snapshot cũ chỉ giữ tuyến, không chắc giữ cả route_view_cache.
+    - Nếu cache mất, quay lại Tìm đường sẽ chạy lại phân tích nguy hiểm rất lâu.
+    """
+    try:
+        if not st.session_state.get("last_routes"):
+            return
+
+        keys = [
+            "last_origin", "last_dest", "last_mode", "last_routes", "last_selected",
+            "last_compared", "last_route_risk_forecast", "last_danger_markers",
+            "last_rest_stops", "last_weather_text", "last_poi_style",
+            "route_runtime_options",
+            "route_view_cache", "route_view_cache_key",
+            "nav_active", "nav_arrived", "nav_polyline", "nav_dest", "nav_mode",
+            "nav_distance_left_osrm", "auto_eta_forecast", "auto_eta_distance_km",
+            "auto_eta_duration_text", "auto_eta_arrival",
+        ]
+        backup = {}
+        for k in keys:
+            if k in st.session_state:
+                backup[k] = st.session_state.get(k)
+        backup["reason"] = reason
+        backup["ts"] = datetime.now().isoformat()
+        st.session_state["__last_good_trip_route_state"] = backup
+    except Exception:
+        pass
+
+
+def _restore_trip_route_state_if_needed():
+    """Khôi phục tuyến/cache nếu quay lại tab Tìm đường mà state bị rơi."""
+    try:
+        if st.session_state.get("last_routes"):
+            return False
+        backup = st.session_state.get("__last_good_trip_route_state")
+        if not isinstance(backup, dict) or not backup.get("last_routes"):
+            return False
+
+        for k, v in backup.items():
+            if k in {"reason", "ts"}:
+                continue
+            st.session_state[k] = v
+
+        # Nếu đã khôi phục tuyến thì không được để phase tìm địa điểm cũ tự chạy lại.
+        for k in [
+            "pending_origin_cands", "pending_dest_cands", "pending_route_options",
+            "sel_origin", "sel_dest", "__route_search_in_progress",
+        ]:
+            st.session_state.pop(k, None)
+
+        st.session_state["__route_restored_from_tab_backup"] = True
+        return True
+    except Exception:
+        return False
+
+
 def _go_menu(menu_name: str):
-    # Trước khi đổi trang, lưu tuyến hiện tại để quay lại không phải tìm lại.
-    _persist_current_route_snapshot()
+    # Trước khi đổi trang, lưu tuyến + cache phân tích để quay lại không tính lại.
+    try:
+        _backup_trip_route_state("go_menu")
+    except Exception:
+        pass
+    try:
+        _persist_current_route_snapshot()
+    except Exception:
+        pass
+    if "Tìm đường" in str(menu_name) or "Trợ lý an toàn" in str(menu_name):
+        st.session_state["__route_tab_return_rerun"] = True
     st.session_state["app_menu"] = menu_name
     st.rerun()
 
@@ -682,6 +1962,10 @@ def _home_card_html(icon, title, desc, target, bg):
 def _render_home_dashboard():
     """Trang chủ dạng tiện ích trực quan như app điện thoại."""
     # Vừa vào Trang chủ cũng lưu lại tuyến hiện tại để khi bấm Tìm đường quay lại không phải tính lại.
+    try:
+        _backup_trip_route_state("home_dashboard")
+    except Exception:
+        pass
     try:
         _persist_current_route_snapshot()
     except Exception:
@@ -867,8 +2151,16 @@ def _render_sos_contacts_manager_compact(prefix: str = "sidebar_sos_family"):
             elif isinstance(result, bool):
                 ok = result
             if ok:
+                # Không gọi st.rerun() ở đây.
+                # Bấm submit form đã tự rerun một lần rồi; gọi rerun lần nữa sẽ khiến
+                # app phân tích/tính tuyến lại thêm lần nữa, gây chậm sau khi nhập SOS.
+                try:
+                    if st.session_state.get("last_routes"):
+                        _persist_current_route_snapshot()
+                except Exception:
+                    pass
+                st.session_state["__sos_contact_submit_rerun"] = True
                 st.success(msg)
-                st.rerun()
             else:
                 st.warning(msg)
         except Exception as e:
@@ -895,9 +2187,15 @@ try:
             # Thẻ Trang chủ dùng query param nên không đi qua _go_menu().
             # Lưu tuyến ngay trước khi đổi menu để quay lại Tìm đường không mất tuyến.
             try:
+                _backup_trip_route_state("query_param_go")
+            except Exception:
+                pass
+            try:
                 _persist_current_route_snapshot()
             except Exception:
                 pass
+            if "Tìm đường" in str(_go_target) or "Trợ lý an toàn" in str(_go_target):
+                st.session_state["__route_tab_return_rerun"] = True
             st.session_state["app_menu"] = _go_target
         try:
             del st.query_params["go"]
@@ -911,12 +2209,15 @@ menu = st.session_state.get("app_menu", "🏠  Trang chủ")
 # Quan trọng: chỉ persist khi KHÔNG đang tìm tuyến mới (để snapshot cũ không đè lên trạng thái mới đang xây dựng).
 try:
     if st.session_state.get("last_routes") and not st.session_state.get("__route_search_in_progress"):
+        _backup_trip_route_state("top_keepalive")
         _persist_current_route_snapshot()
 except Exception:
     pass
 # Nếu người dùng vừa quay lại Tìm đường/Trợ lý sau Trang chủ, khôi phục tuyến đã tìm.
 if "Tìm đường" in menu or "Trợ lý an toàn" in menu:
+    _restore_trip_route_state_if_needed()
     _restore_route_snapshot_if_needed()
+    _restore_trip_route_state_if_needed()
 
 # Đồng bộ GPS trước khi vẽ sidebar SOS.
 # Trước đây sidebar được render trước phần bản đồ nên SOS có thể vẫn ghi "đang chờ GPS"
@@ -976,29 +2277,41 @@ with st.sidebar:
 # SOS nổi cố định: luôn hiện ở góc màn hình, không bị cuộn theo sidebar.
 _render_floating_sos_button(prefix="global_float_sos")
 
-# ── Nhịp 5 phút cho tham chiếu giờ + micro fact ─────────────────────────────
-# Quan trọng: KHÔNG dùng window.location.reload(). Reload trình duyệt làm Streamlit
-# tạo session mới, khiến tuyến vừa tìm bị mất và fun fact quay lại từ đầu.
-# st_autorefresh chỉ rerun app trong cùng session_state, nên tuyến/route cache vẫn giữ.
+# ── Nhịp 5 phút an toàn cho ETA/risk ─────────────────────────────────────────
+# Bật lại st_autorefresh nhưng chỉ dùng để cập nhật ETA/risk theo bucket 5 phút.
+# Phần phân tích tuyến nặng được cache ổn định, nên rerun này không được tính lại tuyến/map.
 try:
     import time as _ts_5min_time
     TRIPSMART_5MIN_REFRESH_SEC = 300
     _tripsmart_5min_bucket = int(_ts_5min_time.time() // TRIPSMART_5MIN_REFRESH_SEC)
     st.session_state["__tripsmart_5min_bucket"] = _tripsmart_5min_bucket
-    if _AUTOREFRESH_OK and st_autorefresh is not None:
-        st_autorefresh(interval=TRIPSMART_5MIN_REFRESH_SEC * 1000, key="tripsmart_5min_refresh_tick")
-    else:
-        st.session_state["__tripsmart_5min_refresh_warning"] = (
-            "Thiếu streamlit-autorefresh nên fun fact/ETA chỉ cập nhật khi app có rerun tự nhiên. "
-            "Cài: pip install streamlit-autorefresh"
+    st.session_state["__tripsmart_5min_refresh_warning"] = ""
+    if _AUTOREFRESH_OK and st_autorefresh is not None and st.session_state.get("last_routes"):
+        st_autorefresh(
+            interval=TRIPSMART_5MIN_REFRESH_SEC * 1000,
+            key="tripsmart_safe_eta_5min_refresh",
+        )
+
+    # Nhịp nhẹ cho panel "cây xăng tiếp theo".
+    # Không refresh 1 giây; chỉ 15 giây/lần khi đang dẫn đường để Python đọc GPS mới
+    # rồi bỏ cây xăng đã đi qua khỏi panel.
+    if (
+        _AUTOREFRESH_OK
+        and st_autorefresh is not None
+        and st.session_state.get("nav_active")
+        and not st.session_state.get("nav_arrived")
+        and st.session_state.get("last_routes")
+    ):
+        st_autorefresh(
+            interval=15 * 1000,
+            key="tripsmart_next_fuel_15s_refresh",
         )
 except Exception:
     _tripsmart_5min_bucket = int(datetime.now().timestamp() // 300)
     st.session_state["__tripsmart_5min_bucket"] = _tripsmart_5min_bucket
 
-# 💡 Micro fact nổi cố định: luôn hiện trên trang, kể cả khi chưa tìm tuyến.
-# Dùng key ổn định để lịch sử fact trong session không bị reset về mẹo đầu tiên.
-# Hàm _render_safety_quiz tự chọn fact mới sau 300 giây dựa trên last_pick_ts.
+# 💡 Micro fact nổi cố định.
+# route_panels.py bản client-side sẽ tự đổi fact bằng JS, không cần rerun toàn app.
 _render_safety_quiz(key_prefix="global_micro_fact")
 
 if not MODULES_OK:
@@ -1032,6 +2345,82 @@ def init_speed_limit_engine():
         return SpeedLimitEngine()
     except Exception:
         return None
+
+
+def _update_tomtom_speed_limit_from_gps(force=False):
+    """
+    Lấy tốc độ tối đa hợp pháp từ TomTom Snap to Roads theo GPS hiện tại.
+
+    - Không gọi API mỗi lần rerun: cache 60 giây.
+    - Nếu chưa có GPS hoặc TomTom không có dữ liệu, trả None và lưu trạng thái rõ ràng.
+    - Không thay thế OSM speed_segments trên bản đồ; chỉ bổ sung tốc độ tối đa tại vị trí hiện tại.
+    """
+    import time as _time
+
+    if not _TOMTOM_SPEED_LIMIT_OK or get_speed_limit_from_tomtom is None:
+        st.session_state["tomtom_speed_limit_status"] = "Chưa load được core.tomtom_speed_limit"
+        return None
+
+    lat = st.session_state.get("nav_gps_lat")
+    lon = st.session_state.get("nav_gps_lon")
+    if lat is None or lon is None:
+        st.session_state["tomtom_speed_limit_status"] = "Chưa có GPS"
+        return None
+
+    now = _time.time()
+
+    # Khi vừa bấm Bắt đầu GPS, không gọi API/network ngay để tránh màn hình bị mờ lâu.
+    # App sẽ đợi GPS ổn định rồi mới cập nhật ở nhịp sau.
+    try:
+        if not force and now < float(st.session_state.get("nav_skip_heavy_until", 0) or 0):
+            st.session_state["tomtom_speed_limit_status"] = "Đang chờ GPS ổn định"
+            return st.session_state.get("tomtom_speed_limit_data")
+    except Exception:
+        pass
+
+    last_check = float(st.session_state.get("tomtom_speed_limit_last_check", 0) or 0)
+    if not force and now - last_check < 60:
+        return st.session_state.get("tomtom_speed_limit_data")
+
+    try:
+        data = get_speed_limit_from_tomtom(float(lat), float(lon))
+    except Exception as e:
+        data = {
+            "ok": False,
+            "speed_limit": None,
+            "unit": "km/h",
+            "message": f"Lỗi gọi TomTom: {e}",
+        }
+
+    st.session_state["tomtom_speed_limit_data"] = data
+    st.session_state["tomtom_speed_limit_last_check"] = now
+
+    if data and data.get("ok"):
+        st.session_state["tomtom_speed_limit_value"] = data.get("speed_limit")
+        st.session_state["tomtom_speed_limit_unit"] = data.get("unit", "km/h")
+        st.session_state["tomtom_speed_limit_status"] = "OK"
+    else:
+        st.session_state["tomtom_speed_limit_value"] = None
+        st.session_state["tomtom_speed_limit_unit"] = "km/h"
+        st.session_state["tomtom_speed_limit_status"] = (data or {}).get("message", "Không có dữ liệu")
+
+    return data
+
+
+def _format_tomtom_speed_limit_text():
+    """Chuẩn hóa text hiển thị tốc độ tối đa TomTom."""
+    value = st.session_state.get("tomtom_speed_limit_value")
+    unit = st.session_state.get("tomtom_speed_limit_unit", "km/h")
+    status = st.session_state.get("tomtom_speed_limit_status", "")
+
+    if value is None:
+        return "Chưa có dữ liệu" if not status else f"Chưa có dữ liệu ({status})"
+
+    try:
+        value_txt = f"{float(value):.0f}"
+    except Exception:
+        value_txt = str(value)
+    return f"{value_txt} {unit}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1218,6 +2607,12 @@ elif "Tìm đường" in menu:
             _clear_route_snapshot_from_browser_session()
             st.session_state["__route_search_in_progress"] = True
             _clear_route_view_cache()
+            # User đang tìm tuyến mới thật sự → bỏ backup/cache tuyến cũ để không restore nhầm.
+            for _k in [
+                "__last_good_trip_route_state", "__route_tab_return_rerun",
+                "__route_restored_from_tab_backup", "__sos_contact_submit_rerun",
+            ]:
+                st.session_state.pop(_k, None)
 
         # ── Phase 2: hiện selectbox + nút Xác nhận (đọc candidates từ session) ──
         _o_cands = st.session_state.get("pending_origin_cands")
@@ -1388,6 +2783,7 @@ elif "Tìm đường" in menu:
             # Đã có tuyến rồi thì xoá phase tìm địa điểm; quay lại trang sẽ hiển thị tuyến cũ, không tự chạy lại từ đầu.
             _clear_pending_route_search_state()
             st.session_state.pop("__route_search_in_progress", None)
+            _backup_trip_route_state("route_computed")
             _persist_current_route_snapshot()
 
     if st.session_state.get("last_routes"):
@@ -1534,14 +2930,32 @@ elif "Tìm đường" in menu:
         # Cache vẫn giữ để đổi menu không mất tuyến, nhưng forecast cần làm mới mỗi 5 phút.
         # Vì vậy thêm bucket 5 phút vào cache key để tự tính lại AI Risk Forecast/tham chiếu giờ.
         if _view_cache_key:
-            # Không chỉ cache theo tuyến, mà còn theo mốc ETA hiệu lực.
-            # Nhờ vậy khi 5 phút trôi qua, ETA đoạn cần chú ý được tính lại và lùi về sau.
-            _view_cache_key = (
-                f"{_view_cache_key}|forecast5m:{_forecast_refresh_bucket}"
-                f"|sliding_eta:{_forecast_reference_dt.strftime('%Y%m%d%H%M')}"
-            )
+            # Cache phân tích tuyến nặng phải ổn định theo tuyến, KHÔNG gắn bucket 5 phút.
+            # ETA/risk forecast sẽ được cập nhật riêng trong cached branch.
+            # Nhờ vậy st_autorefresh 5 phút chỉ cập nhật ETA, không phân tích lại tuyến/map.
+            _view_cache_key = f"{_view_cache_key}|stable_analysis"
         _view_cache = st.session_state.get("route_view_cache") or {}
         _cached_view = _view_cache.get(_view_cache_key) if _view_cache_key else None
+
+        # Khi bấm thêm số SOS, Streamlit bắt buộc rerun toàn app.
+        # Nếu cache key bị lệch nhẹ do widget thời gian/UI, không được phân tích tuyến lại.
+        # Dùng lại cache phân tích tuyến gần nhất miễn là không có thao tác tìm tuyến mới
+        # (_clear_route_view_cache() đã xoá cache khi user bấm tìm tuyến mới).
+        if (
+            not _cached_view
+            and (
+                st.session_state.get("__sos_contact_submit_rerun")
+                or st.session_state.get("__route_tab_return_rerun")
+                or st.session_state.get("__route_restored_from_tab_backup")
+            )
+        ):
+            _last_cache_key = st.session_state.get("route_view_cache_key")
+            if _last_cache_key and isinstance(_view_cache, dict):
+                _cached_view = _view_cache.get(_last_cache_key)
+                if _cached_view and _view_cache_key:
+                    _view_cache[_view_cache_key] = _cached_view
+                    st.session_state["route_view_cache"] = _view_cache
+                    st.session_state["route_view_cache_key"] = _view_cache_key
 
         if _cached_view:
             colored_segs = _cached_view.get("colored_segs", [])
@@ -1551,9 +2965,36 @@ elif "Tìm đường" in menu:
             rest_stops = _cached_view.get("rest_stops", [])
             route_risk_forecast = _cached_view.get("route_risk_forecast")
             warn_msg = _cached_view.get("warn_msg")
+
+            # Cập nhật riêng ETA/risk forecast mỗi bucket 5 phút, không chạy lại phân tích tuyến nặng.
+            try:
+                _cached_forecast_bucket = int(_cached_view.get("forecast_bucket", -1) or -1)
+            except Exception:
+                _cached_forecast_bucket = -1
+
+            if _cached_forecast_bucket != int(_forecast_refresh_bucket):
+                try:
+                    ml_model_route = init_ml_model()
+                    if ml_model_route is not None and ml_model_route.is_ready:
+                        _new_forecast, _tds, _new_warn = _compute_route_forecast(
+                            polyline, route, _forecast_reference_dt, risk_engine, ml_model_route, weather_api,
+                        )
+                        route_risk_forecast = _new_forecast
+                        warn_msg = _new_warn
+                        _cached_view["route_risk_forecast"] = route_risk_forecast
+                        _cached_view["warn_msg"] = warn_msg
+                        _cached_view["forecast_bucket"] = int(_forecast_refresh_bucket)
+                        if _view_cache_key:
+                            _view_cache[_view_cache_key] = _cached_view
+                            st.session_state["route_view_cache"] = _view_cache
+                except Exception as e:
+                    # Cập nhật ETA/risk chạy âm thầm. Nếu lỗi, giữ forecast cũ,
+                    # không hiện spinner/cảnh báo để tránh gây xao nhãng.
+                    st.session_state["silent_eta_update_error"] = str(e)
+
             if warn_msg:
                 st.caption(warn_msg)
-            st.caption("⚡ Đã dùng lại kết quả phân tích tuyến đã lưu — không tính lại khi quay lại trang Tìm đường.")
+            # Không hiện thông báo cập nhật ETA/risk để tránh gây xao nhãng.
         else:
             with st.spinner("🎨 Tô màu rủi ro từng đoạn..."):
                 colored_segs = risk_engine.score_polyline_segments(polyline)
@@ -1602,21 +3043,14 @@ elif "Tìm đường" in menu:
             with st.spinner("📍 Tìm địa điểm dọc đường..."):
                 pois = poi_engine.get_pois_on_route(polyline, style=poi_style, buffer_km=8.0, max_results=12)
 
-            with st.spinner("⛽ Tìm cây xăng dọc đúng tuyến..."):
-                # Search along route: chỉ lấy cây xăng nằm trong hành lang 300m quanh polyline,
-                # không lấy các cây xăng lệch sang hẻm hoặc đường vòng xa.
-                try:
-                    fuel_stations = poi_engine.get_fuel_stations_on_route(
-                        polyline,
-                        corridor_m=300,
-                        max_results=12,
-                        current_position=(st.session_state.get("nav_gps_lat"), st.session_state.get("nav_gps_lon"))
-                        if st.session_state.get("nav_gps_lat") is not None and st.session_state.get("nav_gps_lon") is not None else None,
-                        only_upcoming=False,
-                    )
-                except Exception as e:
-                    fuel_stations = []
-                    st.caption(f"⚠️ Chưa lấy được cây xăng dọc tuyến: {e}")
+            # Cây xăng: lấy không chặn UI, không truyền GPS để tránh mất cây xăng đoạn đầu.
+            fuel_stations = _get_fuel_stations_nonblocking(
+                poi_engine,
+                polyline,
+                corridor_m=800,
+                max_results=80,
+                wait_sec=4.0,
+            )
 
             with st.spinner("🚦 Lấy giới hạn tốc độ từ OSM..."):
                 # Chỉ dùng maxspeed thật từ OpenStreetMap.
@@ -1637,52 +3071,68 @@ elif "Tìm đường" in menu:
                     st.session_state["speed_limit_error"] = str(e)
 
             if _view_cache_key:
-                st.session_state["route_view_cache"] = {
-                    _view_cache_key: {
-                        "colored_segs": colored_segs,
-                        "analysis": analysis,
-                        "danger_markers_raw": danger_markers_raw,
-                        "danger_markers": danger_markers,
-                        "rest_stops": rest_stops,
-                        "route_risk_forecast": route_risk_forecast,
-                        "warn_msg": warn_msg,
-                        "pois": pois,
-                        "fuel_stations": fuel_stations,
-                        "speed_segments": speed_segments,
-                    }
+                _existing_route_view_cache = st.session_state.get("route_view_cache") or {}
+                if not isinstance(_existing_route_view_cache, dict):
+                    _existing_route_view_cache = {}
+                _existing_route_view_cache[_view_cache_key] = {
+                    "colored_segs": colored_segs,
+                    "analysis": analysis,
+                    "danger_markers_raw": danger_markers_raw,
+                    "danger_markers": danger_markers,
+                    "rest_stops": rest_stops,
+                    "route_risk_forecast": route_risk_forecast,
+                    "forecast_bucket": int(_forecast_refresh_bucket),
+                    "warn_msg": warn_msg,
+                    "pois": pois,
+                    "fuel_stations": fuel_stations,
+                    "speed_segments": speed_segments,
                 }
+                # Giữ tối đa vài cache gần nhất để tránh session_state phình quá lớn.
+                try:
+                    if len(_existing_route_view_cache) > 4:
+                        for _old_key in list(_existing_route_view_cache.keys())[:-4]:
+                            _existing_route_view_cache.pop(_old_key, None)
+                except Exception:
+                    pass
+                st.session_state["route_view_cache"] = _existing_route_view_cache
                 st.session_state["route_view_cache_key"] = _view_cache_key
+                _backup_trip_route_state("route_analysis_cached")
 
         if _cached_view:
             pois = _cached_view.get("pois", [])
             fuel_stations = _cached_view.get("fuel_stations", [])
+            if fuel_stations:
+                st.session_state["last_route_fuel_stations_all"] = fuel_stations
             speed_segments = _cached_view.get("speed_segments", [])
         else:
             fuel_stations = locals().get("fuel_stations", [])
             speed_segments = locals().get("speed_segments", [])
 
-        # FIX: fuel data không được phụ thuộc hoàn toàn vào route_view_cache.
-        # Nếu lần trước Overpass lỗi hoặc cache cũ lưu rỗng, app sẽ tự fetch lại thay vì
-        # cứ hiện “Chưa có cây xăng dọc tuyến” mãi.
+        # Đã xử lý xong rerun do thêm SOS/đổi tab; các rerun sau hoạt động bình thường.
+        st.session_state.pop("__sos_contact_submit_rerun", None)
+        st.session_state.pop("__route_tab_return_rerun", None)
+        st.session_state.pop("__route_restored_from_tab_backup", None)
+        try:
+            _backup_trip_route_state("route_display_ready")
+        except Exception:
+            pass
+
+        # Cây xăng fallback không chặn UI.
+        # Không gọi Overpass đồng bộ ở đây nữa, tránh kẹt app.
         if not fuel_stations and polyline:
-            try:
-                fuel_stations = poi_engine.get_fuel_stations_on_route(
-                    polyline,
-                    corridor_m=300,
-                    max_results=20,
-                    current_position=None,
-                    only_upcoming=False,
-                )
-                st.session_state["fuel_along_route_count"] = len(fuel_stations or [])
-                # cập nhật lại cache hiện tại để lần sau không rỗng nữa
-                if _view_cache_key and st.session_state.get("route_view_cache"):
-                    try:
-                        st.session_state["route_view_cache"][_view_cache_key]["fuel_stations"] = fuel_stations
-                    except Exception:
-                        pass
-            except Exception as e:
-                st.session_state["fuel_along_route_error"] = str(e)
-                fuel_stations = []
+            fuel_stations = _get_fuel_stations_nonblocking(
+                poi_engine,
+                polyline,
+                corridor_m=800,
+                max_results=80,
+                wait_sec=0.1,
+            )
+            st.session_state["fuel_along_route_count"] = len(fuel_stations or [])
+            if fuel_stations and _view_cache_key and st.session_state.get("route_view_cache"):
+                try:
+                    st.session_state["route_view_cache"][_view_cache_key]["fuel_stations"] = fuel_stations
+                except Exception:
+                    pass
 
         # Speed limit không dùng suy luận: nếu OSM không có maxspeed thì để trống để UI hiện “Không có thông tin”.
         if not speed_segments and polyline:
@@ -1705,16 +3155,44 @@ elif "Tìm đường" in menu:
                 st.session_state["speed_limit_error"] = str(e)
                 speed_segments = []
 
-        # Hai cây xăng tiếp theo trên đúng tuyến. Khi GPS đi qua cây 1, cây 2 tự lên đầu.
+        # Khóa cây xăng theo tuyến hiện tại. Nếu người dùng tìm tuyến mới,
+        # tuyệt đối không dùng lại marker/cây xăng của tuyến cũ.
+        _current_fuel_route_key = _fuel_route_cache_key(polyline, corridor_m=800, max_results=80)
+        if st.session_state.get("last_route_fuel_key") not in (None, _current_fuel_route_key):
+            st.session_state.pop("last_route_fuel_stations_all", None)
+            st.session_state.pop("next_fuel_stations", None)
+            fuel_stations = []
+
+        # FINAL FUEL FIX:
+        # Luôn có marker nhiên liệu để UI không bao giờ trắng.
+        # Ưu tiên cây xăng thật; nếu OSM/Overpass rỗng/chậm thì dùng điểm nhắc kiểm tra nhiên liệu
+        # có nhãn fallback rõ ràng, không giả mạo là cây xăng thật.
+        fuel_stations, __fuel_is_fallback = _ts_ensure_visible_fuel_markers(
+            fuel_stations,
+            polyline,
+            max_results=24,
+        )
+
+        # Hai cây xăng tiếp theo theo GPS thật.
+        # Khi đi qua cây xăng thứ 1 khoảng 300m, nó tự bị loại khỏi panel,
+        # cây tiếp theo sẽ lên đầu danh sách trong lần rerun nhẹ tiếp theo.
         _current_gps_for_fuel = None
         if st.session_state.get("nav_gps_lat") is not None and st.session_state.get("nav_gps_lon") is not None:
             _current_gps_for_fuel = (float(st.session_state.get("nav_gps_lat")), float(st.session_state.get("nav_gps_lon")))
-        try:
-            next_fuel_stations = poi_engine.get_next_fuel_stations(
-                fuel_stations, polyline, current_position=_current_gps_for_fuel, max_results=2
-            )
-        except Exception:
+
+        next_fuel_stations = _ts_next_fuel_after_gps_progress(
+            fuel_stations,
+            polyline,
+            current_position=_current_gps_for_fuel,
+            max_results=2,
+            passed_margin_km=0.30,
+        )
+        if not next_fuel_stations:
             next_fuel_stations = (fuel_stations or [])[:2]
+            st.session_state["next_fuel_stations"] = next_fuel_stations
+
+        st.session_state["fuel_visible_count"] = len(fuel_stations or [])
+        st.session_state["fuel_visible_fallback"] = bool(__fuel_is_fallback)
 
         rpts = crowd.get_nearby_reports(lat1, lon1, 60)
 
@@ -1891,21 +3369,28 @@ elif "Tìm đường" in menu:
                         st.session_state["nav_reroute_pl"]    = None
                         st.session_state["nav_reroute_risk"]  = None
                         st.session_state["nav_last_reroute"]  = 0.0
-                        # Tạm dùng điểm xuất phát làm marker ban đầu; chưa coi là GPS thật
-                        # cho tới khi trình duyệt đồng bộ được vị trí live.
-                        st.session_state["nav_gps_lat"]       = lat1
-                        st.session_state["nav_gps_lon"]       = lon1
+                        # Không gán GPS giả bằng điểm xuất phát.
+                        # Marker GPS thật sẽ chạy bằng JS watchPosition trong bản đồ.
+                        # Python chỉ cập nhật ETA sau khi đọc được GPS thật từ trình duyệt.
+                        st.session_state["nav_gps_lat"]       = None
+                        st.session_state["nav_gps_lon"]       = None
                         st.session_state["nav_gps_ts"]        = 0.0
-                        st.session_state["nav_gps_source"]    = "origin_initial"
+                        st.session_state["nav_gps_source"]    = "waiting_browser_gps"
                         st.session_state["nav_arrived"]       = False
                         st.session_state["nav_steps"]         = route.get("steps", [])
                         st.session_state["nav_distance_left"] = route.get("distance_km", 0)
                         st.session_state["nav_distance_left_osrm"] = route.get("distance_km", 0)
                         st.session_state["nav_step_text"]     = ""
+                        import time as _nav_start_time
+                        # Chống đứng màn hình mờ: không chạy route/API forecast nặng ngay trong lần bấm GPS.
+                        # Sau khi GPS thật ổn định, ETA/risk sẽ cập nhật ở nhịp 5 phút tiếp theo.
+                        st.session_state["auto_eta_last_ts"] = _nav_start_time.time()
+                        st.session_state["auto_eta_status"] = ""
+                        st.session_state["nav_skip_heavy_until"] = _nav_start_time.time() + 20
                         for _eta_k in [
-                            "auto_eta_last_ts", "auto_eta_distance_km", "auto_eta_duration_text",
+                            "auto_eta_distance_km", "auto_eta_duration_text",
                             "auto_eta_arrival", "auto_eta_updated_at", "auto_eta_forecast",
-                            "auto_eta_ai_ready", "auto_eta_status", "auto_eta_ai_status",
+                            "auto_eta_ai_ready", "auto_eta_ai_status",
                         ]:
                             st.session_state.pop(_eta_k, None)
                         st.rerun()
@@ -1986,11 +3471,11 @@ elif "Tìm đường" in menu:
                     and (now - ss.get("nav_last_reroute", 0.0)) > 15
                 )
                 if need_reroute:
-                    with st.spinner("🔄 Đang tính lại tuyến an toàn..."):
-                        new_pl, new_risk, new_steps, _summary = _do_reroute(
-                            router, risk_engine, g_lat, g_lon, dest_lat, dest_lon,
-                            ss.get("nav_mode", mode),
-                        )
+                    # Tính lại tuyến an toàn âm thầm, không dùng spinner để tránh làm mờ UI.
+                    new_pl, new_risk, new_steps, _summary = _do_reroute(
+                        router, risk_engine, g_lat, g_lon, dest_lat, dest_lon,
+                        ss.get("nav_mode", mode),
+                    )
                     if new_pl:
                         ss["nav_polyline"]     = new_pl
                         ss["nav_risk_segs"]    = new_risk
@@ -2028,19 +3513,27 @@ elif "Tìm đường" in menu:
         _now_ts = _time_mod.time()
 
         if _ss.get("nav_active") and not _ss.get("nav_arrived"):
-            _last_eta_ts = _ss.get("auto_eta_last_ts", 0.0)
-            _first_run   = (_last_eta_ts == 0.0)
+            _last_eta_ts = float(_ss.get("auto_eta_last_ts", 0.0) or 0.0)
             _due_for_eta = (_now_ts - _last_eta_ts) >= AUTO_ETA_INTERVAL_SEC
-            if _first_run or _due_for_eta:
-                with st.spinner("🔄 Đang tự động cập nhật ETA và AI Risk Forecast..."):
-                    _run_auto_eta_update(
-                        router=router,
-                        risk_engine=risk_engine,
-                        weather_api=weather_api,
-                        dest_fallback=(lat2, lon2),
-                        mode_fallback=mode,
-                        now_ts=_now_ts,
-                    )
+            _gps_ts_for_eta = float(_ss.get("nav_gps_ts", 0.0) or 0.0)
+            _gps_age_for_eta = (_now_ts - _gps_ts_for_eta) if _gps_ts_for_eta else 999999
+            _skip_heavy = _now_ts < float(_ss.get("nav_skip_heavy_until", 0) or 0)
+
+            # Không cập nhật ETA ngay khi vừa bấm GPS, vì router/weather/API có thể làm màn hình mờ lâu.
+            # Chỉ chạy khi: đã tới nhịp 5 phút, có GPS thật còn mới, và hết thời gian chờ ổn định.
+            if _due_for_eta and _gps_ts_for_eta > 0 and _gps_age_for_eta <= GPS_MAX_AGE_SEC and not _skip_heavy:
+                _run_auto_eta_update(
+                    router=router,
+                    risk_engine=risk_engine,
+                    weather_api=weather_api,
+                    dest_fallback=(lat2, lon2),
+                    mode_fallback=mode,
+                    now_ts=_now_ts,
+                )
+            elif _skip_heavy:
+                _ss["auto_eta_status"] = ""
+            elif _gps_ts_for_eta <= 0:
+                _ss["auto_eta_status"] = ""
 
         # ── Thẻ tóm tắt ETA nhỏ gọn (hiển thị khi đang dẫn đường) ───────────
         if _ss.get("nav_active") and not _ss.get("nav_arrived"):
@@ -2072,10 +3565,33 @@ elif "Tìm đường" in menu:
         if st.session_state.get("nav_active") and st.session_state.get("nav_polyline"):
             _gps_progress_polyline = st.session_state.get("nav_polyline")
 
+        if st.session_state.get("manual_reroute_applied_msg"):
+            st.success(st.session_state.pop("manual_reroute_applied_msg") + " Tuyến cũ đã bị thay, không mở bản đồ phụ.")
+
         # BẢN ĐỒ — gộp tuyến hành trình + GPS hiện tại trong CÙNG 1 bản đồ
         st.subheader("🗺️ Bản đồ hành trình")
         _nav_active = st.session_state.get("nav_active", False)
-        alt_routes_other = [rt for i,rt in enumerate(routes) if i != selected]
+        # Sau khi thay tuyến hiện tại bằng tuyến vòng, không giữ tuyến cũ làm tuyến phụ.
+        if st.session_state.get("last_incident_reroute") and len(st.session_state.get("last_routes") or []) == 1:
+            alt_routes_other = []
+        else:
+            alt_routes_other = [rt for i,rt in enumerate(routes) if i != selected]
+        _map_fuel_route_key = _fuel_route_cache_key(polyline, corridor_m=800, max_results=80)
+        _route_cached_fuel = (
+            st.session_state.get("last_route_fuel_stations_all", [])
+            if st.session_state.get("last_route_fuel_key") == _map_fuel_route_key
+            else []
+        )
+        fuel_stations_for_map = fuel_stations or _route_cached_fuel
+        fuel_stations_for_map, __fuel_map_is_fallback = _ts_ensure_visible_fuel_markers(
+            fuel_stations_for_map,
+            polyline,
+            max_results=24,
+        )
+        if fuel_stations_for_map and not __fuel_map_is_fallback:
+            st.session_state["last_route_fuel_key"] = _map_fuel_route_key
+            st.session_state["last_route_fuel_stations_all"] = fuel_stations_for_map
+
         map_html = make_full_map(
             lat1, lon1, lat2, lon2,
             colored_segments=colored_segs,
@@ -2083,7 +3599,7 @@ elif "Tìm đường" in menu:
             alt_routes=alt_routes_other,
             danger_markers=danger_markers,
             rest_suggestions=rest_stops,
-            pois=((fuel_stations or []) + pois),
+            pois=((fuel_stations_for_map or []) + pois),
             reports=rpts,
             forecast_segments=(st.session_state.get("auto_eta_forecast") or route_risk_forecast or {}).get("segments"),
             gps_position=gps_position,
@@ -2093,7 +3609,15 @@ elif "Tìm đường" in menu:
             avg_speed_kmh=float(_avg_speed_kmh_by_mode(mode) or 40.0),
             speed_segments=speed_segments,
         )
+        # Lớp JS này đảm bảo marker ⛽ vẫn hiện kể cả ui.streamlit_map.py không đọc đúng format POI.
+        map_html = _ts_inject_fuel_markers_html(map_html, fuel_stations_for_map)
         components.html(map_html, height=620, scrolling=False)
+
+        # TomTom speed limit chỉ cần GPS hiện tại. Nếu chưa bật dẫn đường nhưng đã có GPS,
+        # vẫn thử hiển thị dạng caption để kiểm tra API.
+        if not gps_position and st.session_state.get("nav_gps_lat") is not None and st.session_state.get("nav_gps_lon") is not None:
+            _update_tomtom_speed_limit_from_gps()
+            st.caption(f"🚘 Tốc độ tối đa theo TomTom: {_format_tomtom_speed_limit_text()}")
 
         # ── HUD nhỏ khi đang dẫn đường ────────────────────────────────────────
         if gps_position:
@@ -2103,10 +3627,15 @@ elif "Tìm đường" in menu:
             _gps_ts = st.session_state.get("nav_gps_ts", 0.0)
             _gps_age_txt = "GPS mới" if _gps_ts else "chờ GPS thật"
 
-            h1, h2, h3 = st.columns(3)
+            # Cập nhật speed limit TomTom tối đa mỗi 60 giây theo GPS hiện tại.
+            _update_tomtom_speed_limit_from_gps()
+            _tomtom_speed_txt = _format_tomtom_speed_limit_text()
+
+            h1, h2, h3, h4 = st.columns(4)
             h1.metric("📍 Còn lại", _dist_left_txt)
             h2.metric("📡 Lệch tuyến", "Có" if gps_position["off_route"] else "Không")
             h3.metric("🛰️ GPS", _gps_age_txt)
+            h4.metric("🚘 Tốc độ tối đa", _tomtom_speed_txt)
 
         # ── GPS cập nhật tự động qua JS watchPosition() trong bản đồ ──────────
         # Không cần st_autorefresh hay reload Streamlit — marker GPS di chuyển
@@ -2563,75 +4092,71 @@ elif "Tìm đường" in menu:
                 # ── REROUTE ──────────────────────────────────────────────────────────────
                 if st.session_state.get("last_routes"):
                     st.divider()
-                    st.subheader("🔄 Tránh sự cố — Tính tuyến vòng")
-                    st.markdown('<div class="reroute-box">Nhập vị trí sự cố để tính tuyến vòng tránh.</div>',
+                    st.subheader("🔄 Tránh sự cố — Thay tuyến hiện tại")
+                    st.markdown('<div class="reroute-box">Nhập vị trí sự cố; app sẽ tìm tuyến mới và thay luôn tuyến hiện tại, không mở map phụ.</div>',
                                 unsafe_allow_html=True)
                     rc1,rc2 = st.columns(2)
                     with rc1:
                         incident_loc = st.text_input("📍 Vị trí sự cố", placeholder="VD: 11.2,107.38", key="inc_loc")
                     with rc2:
-                        avoid_r = st.slider("Bán kính tránh (km)", 1.0, 10.0, 3.0, 0.5, key="avoid_r")
+                        _avoid_choice = st.radio(
+                            "Chọn khoảng tuyến vòng",
+                            ["1 km", "5 km", "20 km"],
+                            horizontal=True,
+                            key="avoid_r_choice",
+                            help="1 km: tìm trong khoảng 1–5 km; 5 km: tìm 5–20 km; 20 km: tìm tuyến vòng xa hơn 20 km."
+                        )
+                        avoid_r = {"1 km": 1.0, "5 km": 5.0, "20 km": 20.0}.get(_avoid_choice, 1.0)
+                        st.caption("1 km → tìm 1–5 km · 5 km → tìm 5–20 km · 20 km → tìm >20 km")
 
-                    if st.button("🔄 Tính tuyến vòng", type="secondary", key="btn_reroute"):
+                    if st.button("🔄 Tìm tuyến vòng 1 lần", type="secondary", key="btn_reroute"):
                         if not incident_loc:
                             st.warning("Nhập vị trí sự cố trước.")
                         else:
                             with st.spinner("Đang tính..."):
-                                ilat,ilon = resolve_location(incident_loc, maps_api)
+                                ilat, ilon = resolve_location(incident_loc, maps_api)
                             if not ilat:
                                 st.error("❌ Không tìm được vị trí sự cố.")
                             else:
                                 origin = st.session_state["last_origin"]
                                 dest   = st.session_state["last_dest"]
                                 mode_r = st.session_state["last_mode"]
+                                old_route = (st.session_state.get("last_routes") or [{}])[st.session_state.get("last_selected", 0)]
 
-                                with st.spinner("🛣️ Tính tuyến vòng (OSRM)..."):
-                                    new_rt = router.reroute_around_incident(
-                                        origin, dest, ilat, ilon,
-                                        mode=mode_r, avoid_radius_km=avoid_r)
-                                    _apply_avg_speed_timing(new_rt, mode_r)
+                                with st.spinner("🛣️ Đang tìm tuyến vòng theo khoảng đã chọn..."):
+                                    new_rt, explain = _ts_find_best_incident_reroute(
+                                        router=router,
+                                        origin=origin,
+                                        dest=dest,
+                                        ilat=ilat,
+                                        ilon=ilon,
+                                        mode_r=mode_r,
+                                        avoid_r=avoid_r,
+                                        old_route=old_route,
+                                    )
 
                                 if new_rt and not new_rt.get("fallback"):
-                                    st.session_state["last_incident_reroute"] = new_rt
-                                    st.success(
-                                        f"✅ Tuyến vòng: 📏 {new_rt.get('distance_text','?')} "
-                                        f"· ⏱️ {new_rt.get('duration_text','?')}")
-
-                                    with st.spinner("🎨 Tô màu rủi ro tuyến mới..."):
-                                        new_colored  = risk_engine.score_polyline_segments(new_rt.get("polyline",[]))
-                                        new_analysis = risk_engine.analyze_route(new_rt.get("polyline",[]))
-                                        new_pois     = poi_engine.get_pois_on_route(new_rt.get("polyline",[]), style="all")
-
-                                    lat1r,lon1r = origin
-                                    lat2r,lon2r = dest
-                                    st.markdown("""
-                                    <div class="legend-grad">
-                                      <span>🔵 An toàn</span><div class="grad-bar"></div><span>🔴 Nguy hiểm</span>
-                                      &nbsp;|&nbsp; ⚫ Sự cố &nbsp;|&nbsp; 🟢 Điểm nghỉ
-                                    </div>""", unsafe_allow_html=True)
-                                    reroute_html = make_full_map(
-                                        lat1r, lon1r, lat2r, lon2r,
-                                        colored_segments=new_colored,
-                                        route_polyline=new_rt.get("polyline", []),
-                                        alt_routes=st.session_state["last_routes"],
-                                        danger_markers=_cluster_danger_markers(new_analysis.get("danger_segments",[]), max_items=8),
-                                        rest_suggestions=new_analysis.get("rest_suggestions",[]),
-                                        pois=new_pois,
-                                        incident_marker={"lat":ilat,"lon":ilon,
-                                                         "desc":f"Sự cố · bán kính tránh {avoid_r} km"},
+                                    ok, msg = _ts_apply_manual_incident_reroute_to_session(
+                                        new_rt=new_rt,
+                                        origin=origin,
+                                        dest=dest,
+                                        mode_r=mode_r,
+                                        ilat=ilat,
+                                        ilon=ilon,
+                                        avoid_r=avoid_r,
                                     )
-                                    components.html(reroute_html, height=540, scrolling=False)
-
-                                    steps_r = new_rt.get("steps",[])
-                                    if steps_r:
-                                        with st.expander(f"📋 Hướng dẫn tuyến vòng ({len(steps_r)} bước)"):
-                                            for i,s in enumerate(steps_r,1):
-                                                st.markdown(
-                                                    f'<div class="step-box"><b>{i}.</b> {s["instruction"]} '
-                                                    f'<span style="color:#888;font-size:.8em">— {s["distance_km"]} km · {s["duration_min"]} phút</span></div>',
-                                                    unsafe_allow_html=True)
+                                    if ok:
+                                        st.success(msg + " " + explain)
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
                                 else:
-                                    st.error("❌ Không tính được tuyến vòng. OSRM không thể đến waypoint lệch.")
+                                    st.warning(
+                                        "❌ Không tìm được tuyến vòng khác tuyến cũ. "
+                                        "Khu vực này có thể chỉ có một trục đường khả dụng, "
+                                        "hoặc waypoint tránh không thể snap vào đường. "
+                                        + str(explain)
+                                    )
 
             with _tool_tab_eta:
                 # ── CẬP NHẬT ETA / DỰ BÁO RỦI RO THEO VỊ TRÍ HIỆN TẠI ───────────────────────
