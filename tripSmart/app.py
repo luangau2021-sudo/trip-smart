@@ -125,15 +125,37 @@ load_global_styles()
 st.markdown("""
 <style>
 
-/* FIX MOBILE: hạ nút đóng/mở sidebar xuống để không bị fact trên cùng che */
+/* FIX MOBILE V2: hạ CẢ nút đóng và nút mở sidebar.
+   Nút đóng nằm trong sidebar, nút mở nằm ngoài sidebar nên phải target riêng. */
 @media (max-width: 760px) {
-    div[data-testid="collapsedControl"] {
-        top: 48px !important;
+    /* Nút MỞ sidebar khi sidebar đang đóng */
+    div[data-testid="collapsedControl"],
+    div[data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapsedControl"] {
+        position: fixed !important;
+        top: calc(env(safe-area-inset-top, 0px) + 50px) !important;
+        left: 10px !important;
         z-index: 2147483700 !important;
+        transform: none !important;
+        margin-top: 0 !important;
     }
 
+    div[data-testid="collapsedControl"] button,
+    div[data-testid="stSidebarCollapsedControl"] button,
+    [data-testid="collapsedControl"] button,
+    [data-testid="stSidebarCollapsedControl"] button {
+        transform: none !important;
+        margin-top: 0 !important;
+        z-index: 2147483701 !important;
+    }
+
+    /* Nút ĐÓNG sidebar khi sidebar đang mở */
     section[data-testid="stSidebar"] button[data-testid="baseButton-headerNoPadding"],
     section[data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"],
+    section[data-testid="stSidebar"] button[title="Close sidebar"],
+    section[data-testid="stSidebar"] button[aria-label="Close sidebar"],
+    section[data-testid="stSidebar"] button[aria-label="Hide sidebar navigation"],
     button[data-testid="baseButton-headerNoPadding"],
     button[data-testid="stBaseButton-headerNoPadding"],
     button[title="Close sidebar"],
@@ -153,6 +175,8 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
+
+
 
 st.markdown("""
 <style>
