@@ -599,6 +599,95 @@ def make_full_map(lat1, lon1, lat2, lon2,
   var DEST_LON       = {_dest_lon};
   var OFFROUTE_KM    = 0.025;  // 25 m
 
+  // ── Giữ nguyên zoom/vị trí bản đồ khi GPS cập nhật hoặc Streamlit rerun nhẹ ──
+  // Lưu view theo từng tuyến để route mới vẫn fit_bounds bình thường,
+  // còn route hiện tại thì không bị nhảy về zoom ban đầu mỗi lần có GPS mới.
+  var MAP_VIEW_KEY_PREFIX = 'tripsmart_map_view_v1:';
+
+  function routeViewKey() {{
+    try {{
+      if (!ROUTE_POLY || !ROUTE_POLY.length) return MAP_VIEW_KEY_PREFIX + 'no_route';
+      var first = ROUTE_POLY[0];
+      var last  = ROUTE_POLY[ROUTE_POLY.length - 1];
+      return MAP_VIEW_KEY_PREFIX
+        + Number(first[0]).toFixed(5) + ',' + Number(first[1]).toFixed(5)
+        + '>'
+        + Number(last[0]).toFixed(5) + ',' + Number(last[1]).toFixed(5)
+        + ':'
+        + ROUTE_POLY.length;
+    }} catch(e) {{
+      return MAP_VIEW_KEY_PREFIX + 'fallback';
+    }}
+  }}
+
+  function saveMapView(map) {{
+    try {{
+      if (!map || typeof map.getCenter !== 'function') return;
+      var c = map.getCenter();
+      var payload = {{
+        lat: Number(c.lat),
+        lon: Number(c.lng),
+        zoom: Number(map.getZoom()),
+        ts: Date.now()
+      }};
+      var raw = JSON.stringify(payload);
+      var key = routeViewKey();
+      try {{ localStorage.setItem(key, raw); }} catch(e) {{}}
+      try {{ window.parent.localStorage.setItem(key, raw); }} catch(e) {{}}
+    }} catch(e) {{}}
+  }}
+
+  function loadMapView() {{
+    var raw = null;
+    var key = routeViewKey();
+    try {{ raw = localStorage.getItem(key); }} catch(e) {{}}
+    if (!raw) {{
+      try {{ raw = window.parent.localStorage.getItem(key); }} catch(e) {{}}
+    }}
+    if (!raw) return null;
+
+    try {{
+      var v = JSON.parse(raw);
+      if (!v) return null;
+      if (!Number.isFinite(Number(v.lat)) || !Number.isFinite(Number(v.lon)) || !Number.isFinite(Number(v.zoom))) return null;
+      // View quá cũ thì bỏ, tránh mở lại route cũ sau nhiều giờ.
+      if (Date.now() - Number(v.ts || 0) > 45 * 60 * 1000) return null;
+      return v;
+    }} catch(e) {{
+      return null;
+    }}
+  }}
+
+  function restoreMapView(map) {{
+    try {{
+      if (!map || typeof map.setView !== 'function') return false;
+      var v = loadMapView();
+      if (!v) return false;
+      map.setView([Number(v.lat), Number(v.lon)], Number(v.zoom), {{animate:false}});
+      return true;
+    }} catch(e) {{
+      return false;
+    }}
+  }}
+
+  function bindMapViewMemory(map) {{
+    try {{
+      if (!map || map.__tsViewMemoryBound) return;
+      map.__tsViewMemoryBound = true;
+
+      map.on('moveend zoomend', function() {{
+        saveMapView(map);
+      }});
+
+      // Folium fit_bounds có thể chạy khi iframe vừa dựng lại.
+      // Khôi phục nhiều nhịp ngắn để chặn việc bản đồ nhảy về zoom ban đầu.
+      setTimeout(function() {{ restoreMapView(map); }}, 80);
+      setTimeout(function() {{ restoreMapView(map); }}, 450);
+      setTimeout(function() {{ restoreMapView(map); }}, 1200);
+    }} catch(e) {{}}
+  }}
+
+
   // ── Tìm Leaflet map object ────────────────────────────────────────────────
   function getLeafletMap() {{
     // Folium gắn map vào biến toàn cục có tên map_<uuid>
@@ -912,6 +1001,7 @@ def make_full_map(lat1, lon1, lat2, lon2,
     }}
     initRouteCumulative();
     createStatusBadge(mapObj);
+    bindMapViewMemory(mapObj);
 
     // Tự bật GPS nếu đã có quyền (saved localStorage < 30s)
     try {{
