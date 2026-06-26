@@ -307,24 +307,67 @@ def make_full_map(lat1, lon1, lat2, lon2,
     panel_html = """
     <div id="ts-live-route-panel" style="
         position:absolute; top:12px; left:62px; z-index:9999;
-        width:190px; max-width:38vw;
-        background:rgba(255,255,255,.94);
-        border:1px solid rgba(15,23,42,.12);
-        border-left:4px solid #f97316;
-        border-radius:12px; padding:7px 8px;
+        display:flex; align-items:center; gap:5px; flex-wrap:wrap;
+        max-width:calc(100% - 120px);
         font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-        font-size:10.5px; color:#111827;
-        box-shadow:0 6px 18px rgba(0,0,0,.16);
         pointer-events:none;
     ">
-      <div style="font-weight:900;color:#c2410c;font-size:11.5px;line-height:1.15">⛽ Cây xăng phía trước</div>
-      <div id="ts-live-fuel-list" style="margin-top:5px;line-height:1.18">
-        <span style='color:#6b7280'>Đang tính…</span>
-      </div>
-      <div style="height:1px;background:rgba(15,23,42,.10);margin:6px 0 5px"></div>
-      <div style="font-weight:900;color:#1d4ed8;font-size:11.5px;line-height:1.15">🚦 Tốc độ tối đa</div>
-      <div id="ts-live-speed-limit" style="margin-top:3px;line-height:1.15;color:#6b7280;font-weight:800">
-        Không có thông tin
+      <div id="ts-live-fuel-1" title="Cây xăng tiếp theo" style="
+          background:rgba(255,255,255,.95);
+          border:1px solid rgba(239,68,68,.35);
+          border-radius:999px;
+          padding:4px 7px;
+          font-size:11px;
+          font-weight:900;
+          color:#dc2626;
+          line-height:1;
+          box-shadow:0 3px 10px rgba(0,0,0,.18);
+          white-space:nowrap;
+      ">⛽ -- km</div>
+
+      <div id="ts-live-fuel-2" title="Cây xăng kế tiếp" style="
+          background:rgba(255,255,255,.95);
+          border:1px solid rgba(239,68,68,.35);
+          border-radius:999px;
+          padding:4px 7px;
+          font-size:11px;
+          font-weight:900;
+          color:#dc2626;
+          line-height:1;
+          box-shadow:0 3px 10px rgba(0,0,0,.18);
+          white-space:nowrap;
+      ">⛽ -- km</div>
+
+      <div id="ts-live-speed-limit" title="Tốc độ tối đa đoạn hiện tại" style="
+          background:rgba(255,255,255,.95);
+          border:1px solid rgba(239,68,68,.35);
+          border-radius:999px;
+          padding:2px 7px 2px 3px;
+          font-size:11px;
+          font-weight:900;
+          color:#111827;
+          line-height:1;
+          box-shadow:0 3px 10px rgba(0,0,0,.18);
+          white-space:nowrap;
+          display:flex;
+          align-items:center;
+          gap:4px;
+      ">
+        <span id="ts-speed-sign" style="
+            width:22px;height:22px;
+            border:3px solid #ef4444;
+            border-radius:50%;
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            background:white;
+            color:#111827;
+            font-size:9px;
+            font-weight:1000;
+            line-height:1;
+            box-sizing:border-box;
+        ">?</span>
+        <span id="ts-speed-text">--</span>
       </div>
     </div>
     """
@@ -655,14 +698,32 @@ def make_full_map(lat1, lon1, lat2, lon2,
     return hh + ':' + mm;
   }}
 
+  function setSpeedPillEmpty() {{
+    var signEl = document.getElementById('ts-speed-sign');
+    var textEl = document.getElementById('ts-speed-text');
+    if (signEl) signEl.innerHTML = '?';
+    if (textEl) textEl.innerHTML = '--';
+  }}
+
+  function speedNumberFromText(text, fallback) {{
+    var n = Number(fallback);
+    if (Number.isFinite(n) && n > 0) return String(Math.round(n));
+    var m = String(text || '').match(/[0-9]+/);
+    return m ? m[0] : null;
+  }}
+
   function updateSpeedLimitPanel(curKm) {{
     var speedEl = document.getElementById('ts-live-speed-limit');
-    if (!speedEl) return;
+    var signEl = document.getElementById('ts-speed-sign');
+    var textEl = document.getElementById('ts-speed-text');
+    if (!speedEl || !signEl || !textEl) return;
+
     if (!SPEED_SEGMENTS || !SPEED_SEGMENTS.length) {{
-      speedEl.innerHTML = "Không có thông tin";
-      speedEl.style.color = '#6b7280';
+      setSpeedPillEmpty();
+      speedEl.title = 'Chưa có dữ liệu tốc độ tối đa';
       return;
     }}
+
     var best = null, bestDiff = 999999;
     for (var i = 0; i < SPEED_SEGMENTS.length; i++) {{
       var sg = SPEED_SEGMENTS[i] || {{}};
@@ -670,27 +731,34 @@ def make_full_map(lat1, lon1, lat2, lon2,
       var diff = Math.abs(rk - curKm);
       if (diff < bestDiff) {{ bestDiff = diff; best = sg; }}
     }}
+
     // Nếu maxspeed gần nhất quá xa vị trí hiện tại, coi như đoạn này chưa có thông tin.
     if (!best || bestDiff > 1.2 || best.maxspeed == null) {{
-      speedEl.innerHTML = "Không có thông tin";
-      speedEl.style.color = '#6b7280';
+      setSpeedPillEmpty();
+      speedEl.title = 'Chưa có dữ liệu tốc độ tối đa tại đoạn này';
       return;
     }}
-    var text = String(best.maxspeed_text || (best.maxspeed + ' km/h'));
-    var hw = String(best.highway || '').replace(/[&<>\"']/g, function(c) {{
-      return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[c];
-    }});
-    speedEl.innerHTML = "<span style='font-size:14px;color:#1d4ed8'>" + text + "</span>" +
-                        (hw ? " <span style='font-size:9.5px;color:#6b7280'>(" + hw + ")</span>" : "");
-    speedEl.style.color = '#1d4ed8';
+
+    var rawText = String(best.maxspeed_text || (best.maxspeed + ' km/h'));
+    var speedNo = speedNumberFromText(rawText, best.maxspeed);
+    if (!speedNo) {{
+      setSpeedPillEmpty();
+      speedEl.title = rawText;
+      return;
+    }}
+
+    signEl.innerHTML = speedNo;
+    textEl.innerHTML = 'km/h';
+    speedEl.title = 'Tốc độ tối đa: ' + rawText + (best.highway ? ' · ' + best.highway : '');
   }}
 
   function updateLiveRoutePanel(lat, lon) {{
-    var fuelEl = document.getElementById('ts-live-fuel-list');
-    if (!fuelEl) return;
+    var fuel1El = document.getElementById('ts-live-fuel-1');
+    var fuel2El = document.getElementById('ts-live-fuel-2');
 
     var curKm = currentRouteKm(lat, lon);
     updateSpeedLimitPanel(curKm);
+
     var upcoming = (FUEL_STATIONS || [])
       .filter(function(f) {{ return (Number(f.route_km || 0) - curKm) > 0.03; }})
       .map(function(f) {{
@@ -700,27 +768,25 @@ def make_full_map(lat1, lon1, lat2, lon2,
       .sort(function(a, b) {{ return a.ahead_km - b.ahead_km; }})
       .slice(0, 2);
 
-    if (!upcoming.length) {{
-      fuelEl.innerHTML = "<div style='color:#6b7280;font-size:10.5px'>Chưa có cây xăng phía trước.</div>";
-      return;
+    function setFuelPill(el, fuel, idx) {{
+      if (!el) return;
+      if (!fuel) {{
+        el.innerHTML = '⛽ -- km';
+        el.title = idx === 1 ? 'Chưa có cây xăng tiếp theo' : 'Chưa có cây xăng kế tiếp';
+        return;
+      }}
+      var name = String(fuel.name || ('Cây xăng ' + idx)).replace(/[&<>"']/g, function(c) {{
+        return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+      }});
+      el.innerHTML = '⛽ ' + fmtKm(fuel.ahead_km);
+      el.title = name + ' · còn ' + fmtKm(fuel.ahead_km);
     }}
 
-    var html = '';
-    for (var i = 0; i < upcoming.length; i++) {{
-      var f = upcoming[i];
-      var name = String(f.name || ('Cây xăng ' + (i + 1))).replace(/[&<>\"']/g, function(c) {{
-        return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[c];
-      }});
-      if (name.length > 24) name = name.slice(0, 23) + '…';
-      html += "<div style='display:flex;justify-content:space-between;gap:6px;margin-top:4px;padding-top:4px;border-top:1px solid rgba(15,23,42,.08)'>" +
-              "<div style='min-width:0'><b>" + (i + 1) + ". ⛽</b> <span style='color:#374151'>" + name + "</span></div>" +
-              "<div style='white-space:nowrap;color:#16a34a;font-weight:900'>" + fmtKm(f.ahead_km) + "</div>" +
-              "</div>";
-    }}
-    fuelEl.innerHTML = html;
+    setFuelPill(fuel1El, upcoming[0], 1);
+    setFuelPill(fuel2El, upcoming[1], 2);
   }}
 
-  // ── Tính IoT state từ GPS ─────────────────────────────────────────────────
+    // ── Tính IoT state từ GPS  // ── Tính IoT state từ GPS ─────────────────────────────────────────────────
   function calcIoTState(lat, lon) {{
     var nearestDist = 9999, nearestDanger = null;
     for (var i = 0; i < DANGER_MARKERS.length; i++) {{
