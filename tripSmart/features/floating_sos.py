@@ -327,10 +327,8 @@ function buildSmsBody() {{
              'Thời gian: ' + now + '\n';
   if (gps) {{
     const lat = gps.lat.toFixed(6), lon = gps.lon.toFixed(6);
-    const ageSec = Math.max(0, Math.round((Date.now() - gps.ts) / 1000));
     body += 'Vị trí mới nhất: ' + lat + ', ' + lon + '\n' +
             'Bản đồ: https://maps.google.com/?q=' + lat + ',' + lon + '\n' +
-            'GPS cập nhật cách đây: ' + ageSec + ' giây\n';
   }} else {{
     body += 'Vị trí: chưa lấy được GPS. Hãy gọi lại ngay để xác minh vị trí.\n';
   }}
@@ -518,10 +516,8 @@ def _render_floating_sos_button(prefix: str = "floating_sos"):
                'Thời gian: ' + now + '\\n';
     if (latestGps) {{
       const lat = latestGps.lat.toFixed(6), lon = latestGps.lon.toFixed(6);
-      const age = ageSec();
       body += 'Vị trí mới nhất: ' + lat + ', ' + lon + '\\n' +
               'Bản đồ: https://maps.google.com/?q=' + lat + ',' + lon + '\\n' +
-              'GPS cập nhật cách đây: ' + (age == null ? '?' : age) + ' giây\\n';
     }} else {{
       body += 'Vị trí: chưa lấy được GPS. Hãy gọi lại ngay để xác minh vị trí.\\n';
     }}
