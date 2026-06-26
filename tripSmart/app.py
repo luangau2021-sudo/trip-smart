@@ -2591,20 +2591,11 @@ try:
             key="tripsmart_safe_eta_5min_refresh",
         )
 
-    # Nhịp nhẹ cho panel "cây xăng tiếp theo".
-    # Không refresh 1 giây; chỉ 15 giây/lần khi đang dẫn đường để Python đọc GPS mới
-    # rồi bỏ cây xăng đã đi qua khỏi panel.
-    if (
-        _AUTOREFRESH_OK
-        and st_autorefresh is not None
-        and st.session_state.get("nav_active")
-        and not st.session_state.get("nav_arrived")
-        and st.session_state.get("last_routes")
-    ):
-        st_autorefresh(
-            interval=15 * 1000,
-            key="tripsmart_next_fuel_15s_refresh",
-        )
+    # FIX MAP RESET:
+    # Không dùng st_autorefresh 15 giây cho panel cây xăng khi đang dẫn đường.
+    # st_autorefresh sẽ rerun toàn bộ Streamlit, làm Folium iframe render lại và map tự nhảy
+    # về view ban đầu dù tuyến cũ vẫn còn. Cây xăng/GPS trên bản đồ được cập nhật bằng
+    # JavaScript trong ui/streamlit_map.py nên không cần rerun Python theo nhịp 15 giây.
 except Exception:
     _tripsmart_5min_bucket = int(datetime.now().timestamp() // 300)
     st.session_state["__tripsmart_5min_bucket"] = _tripsmart_5min_bucket

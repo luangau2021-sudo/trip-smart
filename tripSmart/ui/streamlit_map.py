@@ -373,7 +373,7 @@ def make_full_map(lat1, lon1, lat2, lon2,
     """
     m.get_root().html.add_child(folium.Element(panel_html))
 
-    # ── Báo cáo cộng đồng ────────────────────────────────────────────────
+    # ── Báo cáo cộng đồng    # ── Báo cáo cộng đồng ────────────────────────────────────────────────
     RICON = {"accident":("red","exclamation-sign"),"flood":("blue","tint"),
              "traffic_jam":("orange","road"),"bad_road":("orange","warning-sign"),
              "landslide":("darkred","ban-circle")}
@@ -599,10 +599,12 @@ def make_full_map(lat1, lon1, lat2, lon2,
   var DEST_LON       = {_dest_lon};
   var OFFROUTE_KM    = 0.025;  // 25 m
 
-  // ── Giữ nguyên zoom/vị trí bản đồ khi GPS cập nhật hoặc Streamlit rerun nhẹ ──
-  // Lưu view theo từng tuyến để route mới vẫn fit_bounds bình thường,
-  // còn route hiện tại thì không bị nhảy về zoom ban đầu mỗi lần có GPS mới.
+  // ── Giữ nguyên zoom/vị trí bản đồ khi Streamlit rerun nhẹ ───────────────────
+  // Lưu view theo từng tuyến: tuyến mới vẫn fit_bounds bình thường,
+  // tuyến hiện tại không nhảy về view ban đầu khi iframe Folium render lại.
   var MAP_VIEW_KEY_PREFIX = 'tripsmart_map_view_v1:';
+  var MAP_VIEW_READY_TO_SAVE = false;
+  var MAP_VIEW_RESTORE_UNTIL = 0;
 
   function routeViewKey() {{
     try {{
@@ -622,6 +624,9 @@ def make_full_map(lat1, lon1, lat2, lon2,
 
   function saveMapView(map) {{
     try {{
+      // Không lưu view mặc định ngay lúc iframe vừa dựng lại,
+      // tránh ghi đè zoom/vị trí người dùng vừa chỉnh.
+      if (!MAP_VIEW_READY_TO_SAVE || Date.now() < MAP_VIEW_RESTORE_UNTIL) return;
       if (!map || typeof map.getCenter !== 'function') return;
       var c = map.getCenter();
       var payload = {{
@@ -650,7 +655,6 @@ def make_full_map(lat1, lon1, lat2, lon2,
       var v = JSON.parse(raw);
       if (!v) return null;
       if (!Number.isFinite(Number(v.lat)) || !Number.isFinite(Number(v.lon)) || !Number.isFinite(Number(v.zoom))) return null;
-      // View quá cũ thì bỏ, tránh mở lại route cũ sau nhiều giờ.
       if (Date.now() - Number(v.ts || 0) > 45 * 60 * 1000) return null;
       return v;
     }} catch(e) {{
@@ -675,15 +679,27 @@ def make_full_map(lat1, lon1, lat2, lon2,
       if (!map || map.__tsViewMemoryBound) return;
       map.__tsViewMemoryBound = true;
 
+      MAP_VIEW_READY_TO_SAVE = false;
+      MAP_VIEW_RESTORE_UNTIL = Date.now() + 1800;
+
+      function restoreOnly() {{
+        restoreMapView(map);
+      }}
+
+      restoreOnly();
+      setTimeout(restoreOnly, 60);
+      setTimeout(restoreOnly, 220);
+      setTimeout(restoreOnly, 650);
+      setTimeout(restoreOnly, 1250);
+
+      setTimeout(function() {{
+        MAP_VIEW_READY_TO_SAVE = true;
+        saveMapView(map);
+      }}, 1850);
+
       map.on('moveend zoomend', function() {{
         saveMapView(map);
       }});
-
-      // Folium fit_bounds có thể chạy khi iframe vừa dựng lại.
-      // Khôi phục nhiều nhịp ngắn để chặn việc bản đồ nhảy về zoom ban đầu.
-      setTimeout(function() {{ restoreMapView(map); }}, 80);
-      setTimeout(function() {{ restoreMapView(map); }}, 450);
-      setTimeout(function() {{ restoreMapView(map); }}, 1200);
     }} catch(e) {{}}
   }}
 
