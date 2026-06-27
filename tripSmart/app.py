@@ -115,6 +115,19 @@ try:
 except Exception:
     get_speed_limit_from_tomtom = None
     _TOMTOM_SPEED_LIMIT_OK = False
+
+# Goong Speed Limit: ưu tiên lấy tốc độ tối đa tại GPS và dọc tuyến bằng GOONG_API_KEY.
+# Nếu Goong không có dữ liệu/không load được, app tự fallback về TomTom/OSM cũ.
+try:
+    from core.goong_speed_limit import (
+        get_speed_limit_from_goong,
+        get_goong_speed_limits_on_route,
+    )
+    _GOONG_SPEED_LIMIT_OK = True
+except Exception:
+    get_speed_limit_from_goong = None
+    get_goong_speed_limits_on_route = None
+    _GOONG_SPEED_LIMIT_OK = False
 # ============================================
 
 st.set_page_config(page_title="TripSmart Pro", page_icon="🗺️",
@@ -2712,6 +2725,147 @@ def _format_tomtom_speed_limit_text():
     return f"{value_txt} {unit}"
 
 
+def _get_route_speed_segments(polyline, mode, corridor_m=120, sample_every_km=1.5, max_results=120):
+    """
+    Speed limit dọc tuyến:
+    1) Ưu tiên Goong Speed Limit API bằng GOONG_API_KEY đã có.
+    2) Nếu Goong lỗi/không có dữ liệu thì fallback về OSM SpeedLimitEngine cũ.
+    Chỉ thay lớp dữ liệu tốc độ, không thay routing/map/SOS/ETA.
+    """
+    speed_segments = []
+    errors = []
+
+    # Ưu tiên Goong vì phù hợp dữ liệu Việt Nam hơn cho nhiều tuyến lớn.
+    if _GOONG_SPEED_LIMIT_OK and get_goong_speed_limits_on_route is not None:
+        try:
+            speed_segments = get_goong_speed_limits_on_route(
+                polyline,
+                mode=mode,
+                sample_every_km=1.5,
+                max_points=180,
+                max_workers=8,
+            )
+            if speed_segments:
+                st.session_state["speed_limit_source"] = "Goong Speed Limit"
+                st.session_state.pop("speed_limit_error", None)
+                return speed_segments[:max_results]
+        except Exception as e:
+            errors.append(f"Goong: {e}")
+
+    # Fallback giữ nguyên cơ chế OSM cũ.
+    try:
+        speed_engine = init_speed_limit_engine()
+        if speed_engine is not None:
+            speed_segments = speed_engine.get_speed_limits_on_route(
+                polyline,
+                mode=mode,
+                corridor_m=corridor_m,
+                sample_every_km=sample_every_km,
+                max_results=max_results,
+            )
+            if speed_segments:
+                st.session_state["speed_limit_source"] = "OSM maxspeed"
+                st.session_state.pop("speed_limit_error", None)
+                return speed_segments
+    except Exception as e:
+        errors.append(f"OSM: {e}")
+
+    if errors:
+        st.session_state["speed_limit_error"] = " | ".join(errors)
+    st.session_state["speed_limit_source"] = "Không có dữ liệu"
+    return []
+
+
+def _update_current_speed_limit_from_gps(force=False):
+    """
+    Tốc độ tối đa tại GPS hiện tại:
+    - Ưu tiên Goong Speed Limit.
+    - Nếu Goong không có dữ liệu thì fallback TomTom cũ.
+    - Cache 60 giây để không gọi API liên tục khi GPS cập nhật.
+    """
+    import time as _time
+
+    lat = st.session_state.get("nav_gps_lat")
+    lon = st.session_state.get("nav_gps_lon")
+    if lat is None or lon is None:
+        st.session_state["current_speed_limit_value"] = None
+        st.session_state["current_speed_limit_source"] = ""
+        st.session_state["current_speed_limit_status"] = "Chưa có GPS"
+        return None
+
+    now = _time.time()
+
+    try:
+        if not force and now < float(st.session_state.get("nav_skip_heavy_until", 0) or 0):
+            st.session_state["current_speed_limit_status"] = "Đang chờ GPS ổn định"
+            return st.session_state.get("current_speed_limit_data")
+    except Exception:
+        pass
+
+    last_check = float(st.session_state.get("current_speed_limit_last_check", 0) or 0)
+    if not force and now - last_check < 60:
+        return st.session_state.get("current_speed_limit_data")
+
+    data = None
+
+    # 1) Goong trước
+    if _GOONG_SPEED_LIMIT_OK and get_speed_limit_from_goong is not None:
+        try:
+            data = get_speed_limit_from_goong(float(lat), float(lon))
+        except Exception as e:
+            data = {"ok": False, "speed_limit": None, "message": f"Lỗi gọi Goong: {e}", "source": "goong_speed_limit"}
+
+        if data and data.get("ok") and data.get("speed_limit") is not None:
+            st.session_state["current_speed_limit_data"] = data
+            st.session_state["current_speed_limit_last_check"] = now
+            st.session_state["current_speed_limit_value"] = data.get("speed_limit")
+            st.session_state["current_speed_limit_unit"] = data.get("unit", "km/h")
+            st.session_state["current_speed_limit_source"] = "Goong"
+            st.session_state["current_speed_limit_status"] = "OK"
+            return data
+
+    # 2) Fallback TomTom cũ
+    tomtom_data = _update_tomtom_speed_limit_from_gps(force=force)
+    st.session_state["current_speed_limit_data"] = tomtom_data
+    st.session_state["current_speed_limit_last_check"] = now
+
+    if tomtom_data and tomtom_data.get("ok") and tomtom_data.get("speed_limit") is not None:
+        st.session_state["current_speed_limit_value"] = tomtom_data.get("speed_limit")
+        st.session_state["current_speed_limit_unit"] = tomtom_data.get("unit", "km/h")
+        st.session_state["current_speed_limit_source"] = "TomTom"
+        st.session_state["current_speed_limit_status"] = "OK"
+    else:
+        st.session_state["current_speed_limit_value"] = None
+        st.session_state["current_speed_limit_unit"] = "km/h"
+        st.session_state["current_speed_limit_source"] = ""
+        st.session_state["current_speed_limit_status"] = (
+            (data or {}).get("message")
+            or (tomtom_data or {}).get("message")
+            or "Không có dữ liệu"
+        )
+
+    return st.session_state.get("current_speed_limit_data")
+
+
+def _format_current_speed_limit_text():
+    """Chuẩn hóa text hiển thị tốc độ tối đa ưu tiên Goong, fallback TomTom."""
+    value = st.session_state.get("current_speed_limit_value")
+    unit = st.session_state.get("current_speed_limit_unit", "km/h")
+    source = st.session_state.get("current_speed_limit_source", "")
+    status = st.session_state.get("current_speed_limit_status", "")
+
+    if value is None:
+        return "Chưa có dữ liệu" if not status else f"Chưa có dữ liệu ({status})"
+
+    try:
+        value_txt = f"{float(value):.0f}"
+    except Exception:
+        value_txt = str(value)
+
+    suffix = f" · {source}" if source else ""
+    return f"{value_txt} {unit}{suffix}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. TÌM ĐƯỜNG
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3341,23 +3495,16 @@ elif "Tìm đường" in menu:
                 wait_sec=4.0,
             )
 
-            with st.spinner("🚦 Lấy giới hạn tốc độ từ OSM..."):
-                # Chỉ dùng maxspeed thật từ OpenStreetMap.
-                # Nếu đoạn không có maxspeed, map sẽ hiện “Không có thông tin”, không tự suy đoán.
-                speed_segments = []
-                try:
-                    speed_engine = init_speed_limit_engine()
-                    if speed_engine is not None:
-                        speed_segments = speed_engine.get_speed_limits_on_route(
-                            polyline,
-                            mode=mode,
-                            corridor_m=120,
-                            sample_every_km=1.5,
-                            max_results=120,
-                        )
-                except Exception as e:
-                    speed_segments = []
-                    st.session_state["speed_limit_error"] = str(e)
+            with st.spinner("🚦 Lấy giới hạn tốc độ từ Goong/OSM..."):
+                # Ưu tiên Goong Speed Limit API; nếu Goong không có dữ liệu thì giữ fallback OSM cũ.
+                # Không tự suy đoán tốc độ nếu tất cả nguồn đều không có dữ liệu.
+                speed_segments = _get_route_speed_segments(
+                    polyline,
+                    mode=mode,
+                    corridor_m=120,
+                    sample_every_km=1.5,
+                    max_results=120,
+                )
 
             if _view_cache_key:
                 _existing_route_view_cache = st.session_state.get("route_view_cache") or {}
@@ -3423,26 +3570,20 @@ elif "Tìm đường" in menu:
                 except Exception:
                     pass
 
-        # Speed limit không dùng suy luận: nếu OSM không có maxspeed thì để trống để UI hiện “Không có thông tin”.
+        # Speed limit không dùng suy luận: ưu tiên Goong, fallback OSM; nếu không có thì để UI hiện “Không có thông tin”.
         if not speed_segments and polyline:
-            try:
-                speed_engine = init_speed_limit_engine()
-                if speed_engine is not None:
-                    speed_segments = speed_engine.get_speed_limits_on_route(
-                        polyline,
-                        mode=mode,
-                        corridor_m=120,
-                        sample_every_km=1.5,
-                        max_results=120,
-                    )
-                    if _view_cache_key and st.session_state.get("route_view_cache"):
-                        try:
-                            st.session_state["route_view_cache"][_view_cache_key]["speed_segments"] = speed_segments
-                        except Exception:
-                            pass
-            except Exception as e:
-                st.session_state["speed_limit_error"] = str(e)
-                speed_segments = []
+            speed_segments = _get_route_speed_segments(
+                polyline,
+                mode=mode,
+                corridor_m=120,
+                sample_every_km=1.5,
+                max_results=120,
+            )
+            if speed_segments and _view_cache_key and st.session_state.get("route_view_cache"):
+                try:
+                    st.session_state["route_view_cache"][_view_cache_key]["speed_segments"] = speed_segments
+                except Exception:
+                    pass
 
         # Khóa cây xăng theo tuyến hiện tại. Nếu người dùng tìm tuyến mới,
         # tuyệt đối không dùng lại marker/cây xăng của tuyến cũ.
@@ -3905,8 +4046,8 @@ elif "Tìm đường" in menu:
         # TomTom speed limit chỉ cần GPS hiện tại. Nếu chưa bật dẫn đường nhưng đã có GPS,
         # vẫn thử hiển thị dạng caption để kiểm tra API.
         if not gps_position and st.session_state.get("nav_gps_lat") is not None and st.session_state.get("nav_gps_lon") is not None:
-            _update_tomtom_speed_limit_from_gps()
-            st.caption(f"🚘 Tốc độ tối đa theo TomTom: {_format_tomtom_speed_limit_text()}")
+            _update_current_speed_limit_from_gps()
+            st.caption(f"🚘 Tốc độ tối đa theo Goong/TomTom: {_format_current_speed_limit_text()}")
 
         # ── HUD nhỏ khi đang dẫn đường ────────────────────────────────────────
         if gps_position:
@@ -3916,9 +4057,9 @@ elif "Tìm đường" in menu:
             _gps_ts = st.session_state.get("nav_gps_ts", 0.0)
             _gps_age_txt = "GPS mới" if _gps_ts else "chờ GPS thật"
 
-            # Cập nhật speed limit TomTom tối đa mỗi 60 giây theo GPS hiện tại.
-            _update_tomtom_speed_limit_from_gps()
-            _tomtom_speed_txt = _format_tomtom_speed_limit_text()
+            # Cập nhật speed limit Goong/TomTom tối đa mỗi 60 giây theo GPS hiện tại.
+            _update_current_speed_limit_from_gps()
+            _tomtom_speed_txt = _format_current_speed_limit_text()
 
             h1, h2, h3, h4 = st.columns(4)
             h1.metric("📍 Còn lại", _dist_left_txt)
