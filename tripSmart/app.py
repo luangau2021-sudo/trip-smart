@@ -1165,6 +1165,178 @@ def _handle_unknown_location(label: str, name: str, maps_api, coord_key: str) ->
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── FIX SOS CONTACT PERSISTENCE (file + session backup) ─────────────────────
+# Lý do cần file backup: khi người dùng bấm thẻ HTML ở Trang chủ (?go=...),
+# trình duyệt có thể reload phiên Streamlit và làm st.session_state mất số SOS.
+# File ẩn này chỉ lưu local trên máy chạy app, không đụng routing/GPS/map/ETA.
+_TS_SOS_CONTACTS_BACKUP_KEY = "__ts_sos_family_contacts_persistent"
+_TS_SOS_CONTACTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tripsmart_sos_contacts.json")
+
+
+def _ts_sos_clean_contact(name, phone):
+    """Chuẩn hóa 1 contact SOS, trả None nếu thiếu số."""
+    try:
+        n = str(name or "").strip() or "Người thân"
+        p = str(phone or "").strip()
+        if not p:
+            return None
+        return {"name": n, "phone": p}
+    except Exception:
+        return None
+
+
+def _ts_sos_contact_id(contact):
+    """Khóa chống trùng theo số điện thoại đã normalize."""
+    try:
+        phone = contact.get("phone") if isinstance(contact, dict) else ""
+        norm = _sos_normalize_phone_for_sms(phone) or str(phone or "").strip()
+        return str(norm).strip()
+    except Exception:
+        try:
+            return str((contact or {}).get("phone", "")).strip()
+        except Exception:
+            return ""
+
+
+def _ts_sos_dedupe_contacts(contacts):
+    """Lọc contact rỗng/trùng, giữ đúng thứ tự nhập."""
+    out = []
+    seen = set()
+    for c in contacts or []:
+        if not isinstance(c, dict):
+            continue
+        clean = _ts_sos_clean_contact(c.get("name"), c.get("phone"))
+        if not clean:
+            continue
+        cid = _ts_sos_contact_id(clean)
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(clean)
+    return out
+
+
+def _ts_sos_load_contacts_file():
+    """Đọc contact SOS từ file local ẩn. Không làm sập app nếu file lỗi."""
+    try:
+        if not os.path.exists(_TS_SOS_CONTACTS_FILE):
+            return []
+        with open(_TS_SOS_CONTACTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get("contacts", [])
+        return _ts_sos_dedupe_contacts(data if isinstance(data, list) else [])
+    except Exception:
+        return []
+
+
+def _ts_sos_save_contacts_file(contacts):
+    """Ghi contact SOS vào file local để không mất khi đổi menu bằng link HTML."""
+    try:
+        cleaned = _ts_sos_dedupe_contacts(contacts)
+        with open(_TS_SOS_CONTACTS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"contacts": cleaned}, f, ensure_ascii=False, indent=2)
+        return cleaned
+    except Exception:
+        return _ts_sos_dedupe_contacts(contacts)
+
+
+def _ts_sos_save_contacts_backup(contacts):
+    """Lưu danh sách số người thân vào session + file local."""
+    cleaned = _ts_sos_dedupe_contacts(contacts)
+    try:
+        if cleaned:
+            st.session_state[_TS_SOS_CONTACTS_BACKUP_KEY] = cleaned
+    except Exception:
+        pass
+    try:
+        if cleaned:
+            _ts_sos_save_contacts_file(cleaned)
+    except Exception:
+        pass
+    return cleaned
+
+
+def _ts_sos_read_contacts_backup():
+    """Đọc backup SOS từ session trước, nếu rỗng thì đọc file local."""
+    try:
+        session_contacts = _ts_sos_dedupe_contacts(st.session_state.get(_TS_SOS_CONTACTS_BACKUP_KEY, []))
+        if session_contacts:
+            return session_contacts
+    except Exception:
+        pass
+    return _ts_sos_load_contacts_file()
+
+
+def _ts_sos_restore_to_module(contacts):
+    """Khôi phục vào module floating_sos để các phần code cũ vẫn dùng được."""
+    restored = []
+    for c in _ts_sos_dedupe_contacts(contacts):
+        try:
+            _sos_add_family_contact(c.get("name") or "Người thân", c.get("phone") or "")
+        except Exception:
+            pass
+    try:
+        restored = _sos_get_family_contacts() or []
+    except Exception:
+        restored = []
+    return _ts_sos_dedupe_contacts(restored or contacts)
+
+
+def _ts_sos_remember_added_contact(name, phone):
+    """Gọi ngay sau khi bấm thêm số để đảm bảo số không mất khi qua Tìm đường."""
+    new_c = _ts_sos_clean_contact(name, phone)
+    if not new_c:
+        return []
+    merged = []
+    try:
+        _sos_init_state()
+    except Exception:
+        pass
+    try:
+        merged.extend(_sos_get_family_contacts() or [])
+    except Exception:
+        pass
+    merged.extend(_ts_sos_read_contacts_backup())
+    merged.append(new_c)
+    return _ts_sos_save_contacts_backup(merged)
+
+
+def _ts_sos_get_family_contacts_safe():
+    """
+    Lấy contact SOS theo cách chắc chắn:
+    1) module floating_sos hiện tại,
+    2) session_state backup,
+    3) file local ẩn .tripsmart_sos_contacts.json.
+    """
+    try:
+        _sos_init_state()
+    except Exception:
+        pass
+
+    current = []
+    try:
+        current = _sos_get_family_contacts() or []
+    except Exception:
+        current = []
+
+    if current:
+        return _ts_sos_save_contacts_backup(current)
+
+    backup = _ts_sos_read_contacts_backup()
+    if not backup:
+        return []
+
+    restored = _ts_sos_restore_to_module(backup)
+    return _ts_sos_save_contacts_backup(restored or backup)
+
+
+def _ts_sos_has_family_contact():
+    """True nếu đã có ít nhất 1 số người thân hợp lệ."""
+    return bool(_ts_sos_get_family_contacts_safe())
+
+
+
 
 
 
@@ -2212,6 +2384,10 @@ def _render_sos_contacts_manager_compact(prefix: str = "sidebar_sos_family"):
                 # Bấm submit form đã tự rerun một lần rồi; gọi rerun lần nữa sẽ khiến
                 # app phân tích/tính tuyến lại thêm lần nữa, gây chậm sau khi nhập SOS.
                 try:
+                    _ts_sos_remember_added_contact(name, phone)
+                except Exception:
+                    pass
+                try:
                     if st.session_state.get("last_routes"):
                         _persist_current_route_snapshot()
                 except Exception:
@@ -2238,7 +2414,7 @@ def _render_compact_floating_sos_button(prefix: str = "global_float_sos"):
         import html as _html
         _sos_init_state()
 
-        contacts = _sos_get_family_contacts() or []
+        contacts = _ts_sos_get_family_contacts_safe() or []
         numbers = ",".join(
             _sos_normalize_phone_for_sms(c.get("phone"))
             for c in contacts
@@ -2547,6 +2723,12 @@ with st.sidebar:
     # SOS compact: chỉ còn ô tên, ô số điện thoại và dấu +.
     # Không dùng expander/caption dài để người dùng thấy ngay phần nhập.
     _render_sos_contacts_manager_compact(prefix="sidebar_sos_family")
+    try:
+        _ts_saved_sos_contacts = _ts_sos_get_family_contacts_safe()
+        if _ts_saved_sos_contacts:
+            st.caption(f"✅ Đã lưu SOS: {len(_ts_saved_sos_contacts)} số người thân")
+    except Exception:
+        pass
 
     st.divider()
 
@@ -3783,7 +3965,7 @@ elif "Tìm đường" in menu:
                         use_container_width=True,
                         key="btn_start_live_nav",
                     ):
-                        if not _sos_get_family_contacts():
+                        if not _ts_sos_has_family_contact():
                             st.warning("⚠️ Vui lòng nhập ít nhất 1 số điện thoại người thân trong sidebar trước khi bắt đầu dẫn đường GPS để dùng SOS nhanh khi có sự cố.")
                             st.stop()
                         st.session_state["nav_active"]        = True
@@ -4877,7 +5059,7 @@ elif "SOS" in menu:
         for c in result["contacts"]: st.markdown(f"**{c['name']}**: 📞 `{c['number']}`")
         for inst in result["instructions"]: st.markdown(f'<div class="step-box">{inst}</div>',unsafe_allow_html=True)
         st.code(result["message_template"])
-        _contacts = _sos_get_family_contacts()
+        _contacts = _ts_sos_get_family_contacts_safe()
         if _contacts:
             _numbers = ",".join(_sos_normalize_phone_for_sms(c.get("phone")) for c in _contacts)
             _sms_body = _sos_message_template({"accident":"Tai nạn","medical":"Cấp cứu y tế","fire":"Cháy","stranded":"Mắc kẹt","general":"Khẩn cấp khác"}.get(etype, etype), lat, lon, msg)
