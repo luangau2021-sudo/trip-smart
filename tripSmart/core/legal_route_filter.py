@@ -128,19 +128,47 @@ def _step_classes(step: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _is_tiny_expressway_connector(step: Dict[str, Any], txt: str) -> bool:
+    """True nếu chỉ là đoạn đường dẫn/nhánh kết nối rất ngắn.
+
+    OSRM ở Việt Nam đôi khi ghi "Đường dẫn cao tốc" cho một đoạn gom/nhánh rất ngắn
+    gần nút giao. Nếu loại tuyệt đối các đoạn này, tuyến xe máy dài như Đà Lạt -> Hà Nội
+    gần như luôn bị loại dù phần còn lại đi quốc lộ. Tuy nhiên vẫn phải chặn đoạn cao tốc
+    thật như Liên Khương - Prenn dài nhiều km.
+    """
+    try:
+        km = float(step.get("distance_km") or 0.0)
+    except Exception:
+        km = 0.0
+    # "đường dẫn cao tốc" khác với "đường cao tốc". Chỉ dung sai khi rất ngắn.
+    return ("duong dan cao toc" in txt or "đường dẫn cao tốc" in txt) and km <= 1.2
+
+
 def route_has_expressway(route: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
     """Phát hiện tuyến có cao tốc/ĐCT, nhưng không loại nhầm quốc lộ/tỉnh lộ.
 
-    Nguyên tắc:
-    - Xe máy chỉ bị chặn khi có dấu hiệu rõ: motorway/motorway_link/expressway/cao tốc/ĐCT/CTxx.
-    - Không coi chữ "highway" là cao tốc vì đó là tag chung của OSM.
-    - QL1A, QL14, đường Hồ Chí Minh, tỉnh lộ... vẫn được giữ nếu OSRM trả qua chúng.
+    V3: không trả về ngay ở hit đầu tiên. Lý do: OSRM có thể báo một đoạn
+    "Đường dẫn cao tốc" rất ngắn 0.5-1 km ở nút giao. Nếu tuyến chỉ có connector nhỏ
+    như vậy thì không loại cả tuyến. Nhưng nếu có đoạn cao tốc thật dài, đặc biệt
+    Liên Khương - Prenn, ĐCT/CTxx/motorway, vẫn loại.
     """
+    minor_connectors: List[str] = []
+
     for step in iter_route_steps(route):
         txt = _step_text(step)
         classes = _step_classes(step)
         detail = step.get("instruction") or step.get("name") or step.get("ref") or "cao tốc/ĐCT"
+        try:
+            step_km = float(step.get("distance_km") or 0.0)
+        except Exception:
+            step_km = 0.0
 
+        # Bỏ qua connector rất ngắn kiểu "Đường dẫn cao tốc" để tránh false-negative.
+        if _is_tiny_expressway_connector(step, txt):
+            minor_connectors.append(f"{detail} ({step_km:.1f} km)")
+            continue
+
+        # OSRM class motorway/motorway_link là dấu hiệu mạnh.
         if any(c in {"motorway", "motorway_link"} for c in classes):
             return True, detail
 
@@ -148,16 +176,17 @@ def route_has_expressway(route: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
         if re.search(r"\b(dct|đct)\s*\d+\b", txt) or re.search(r"\bct[ .-]?\d+\b", txt):
             return True, detail
 
-        # Cụm từ rõ nghĩa cao tốc.
+        # Cụm từ rõ nghĩa cao tốc. Phân biệt đường dẫn cao tốc nhỏ đã được xử lý phía trên.
         if "cao toc" in txt or "cao tốc" in txt or "expressway" in txt or "motorway" in txt or "freeway" in txt:
             return True, detail
 
-        # Không bắt các tên hợp lệ như QL1A/QL14/QL20/tỉnh lộ/đường Hồ Chí Minh.
         for kw in EXPRESSWAY_KEYWORDS:
             if kw in {"highway"}:
                 continue
             if kw in txt:
                 return True, detail
+
+    # Nếu chỉ có connector nhỏ thì không loại tuyến.
     return False, ""
 
 
