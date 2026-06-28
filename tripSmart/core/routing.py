@@ -1023,10 +1023,33 @@ class Router:
                 step_dist = step.get("distance", 0)
                 step_raw = round(step.get("duration", 0) / 60, 1)
                 step_real = _apply_vn_factor(step_raw, step_dist / 1000, mode)
+                # Giữ metadata thô của OSRM để legal_route_filter.py kiểm tra chính xác hơn.
+                # Trước đây chỉ lưu instruction/distance/duration nên bộ lọc phải đoán từ text;
+                # điều đó dễ loại nhầm quốc lộ/tỉnh lộ là cao tốc.
+                step_name = step.get("name") or ""
+                step_ref = step.get("ref") or ""
+                step_mode = step.get("mode") or ""
+                step_classes = step.get("classes") or []
+                intersections = step.get("intersections") or []
                 steps.append({
                     "instruction": self._instruction(maneuver, step),
                     "distance_km": round(step_dist / 1000, 2),
                     "duration_min": step_real,
+                    "name": step_name,
+                    "ref": step_ref,
+                    "mode": step_mode,
+                    "maneuver_type": maneuver.get("type", ""),
+                    "maneuver_modifier": maneuver.get("modifier", ""),
+                    "classes": step_classes,
+                    "raw": {
+                        "name": step_name,
+                        "ref": step_ref,
+                        "mode": step_mode,
+                        "classes": step_classes,
+                        "maneuver_type": maneuver.get("type", ""),
+                        "maneuver_modifier": maneuver.get("modifier", ""),
+                        "intersections": intersections[:3],
+                    },
                 })
 
         return {
