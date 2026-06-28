@@ -68,8 +68,14 @@ MOTORBIKE_CORRIDORS: List[Dict] = [
         # Dùng các đô thị lớn nằm trên/gan QL1A và đường kết nối từ Đà Lạt ra ven biển.
         # Không phải graph pháp lý tuyệt đối; legal_route_filter.py vẫn kiểm tra lại cao tốc.
         "south_to_north": [
+            # Thoát Đà Lạt bằng hướng Trại Mát - Cầu Đất - Đơn Dương - Dran,
+            # tránh việc OSRM kéo xuống cao tốc Liên Khương - Prenn.
             ("Đà Lạt", 11.9404, 108.4583),
-            ("Đức Trọng", 11.7350, 108.3730),
+            ("Trại Mát", 11.9290, 108.5050),
+            ("Cầu Đất", 11.9440, 108.5750),
+            ("Đơn Dương", 11.7760, 108.4980),
+            ("Dran", 11.7350, 108.5900),
+            ("Ninh Sơn", 11.7100, 108.8500),
             ("Phan Rang", 11.5639, 108.9880),
             ("Nha Trang", 12.2388, 109.1967),
             ("Tuy Hòa", 13.0955, 109.3209),
@@ -96,7 +102,11 @@ MOTORBIKE_CORRIDORS: List[Dict] = [
             ("Tuy Hòa", 13.0955, 109.3209),
             ("Nha Trang", 12.2388, 109.1967),
             ("Phan Rang", 11.5639, 108.9880),
-            ("Đức Trọng", 11.7350, 108.3730),
+            ("Ninh Sơn", 11.7100, 108.8500),
+            ("Dran", 11.7350, 108.5900),
+            ("Đơn Dương", 11.7760, 108.4980),
+            ("Cầu Đất", 11.9440, 108.5750),
+            ("Trại Mát", 11.9290, 108.5050),
             ("Đà Lạt", 11.9404, 108.4583),
         ],
     },
@@ -111,6 +121,10 @@ MOTORBIKE_CORRIDORS: List[Dict] = [
         },
         "south_to_north": [
             ("Đà Lạt", 11.9404, 108.4583),
+            ("Trại Mát", 11.9290, 108.5050),
+            ("Cầu Đất", 11.9440, 108.5750),
+            ("Đơn Dương", 11.7760, 108.4980),
+            ("Dran", 11.7350, 108.5900),
             ("Buôn Ma Thuột", 12.6667, 108.0500),
             ("Pleiku", 13.9833, 108.0000),
             ("Kon Tum", 14.3500, 108.0000),
@@ -135,6 +149,10 @@ MOTORBIKE_CORRIDORS: List[Dict] = [
             ("Kon Tum", 14.3500, 108.0000),
             ("Pleiku", 13.9833, 108.0000),
             ("Buôn Ma Thuột", 12.6667, 108.0500),
+            ("Dran", 11.7350, 108.5900),
+            ("Đơn Dương", 11.7760, 108.4980),
+            ("Cầu Đất", 11.9440, 108.5750),
+            ("Trại Mát", 11.9290, 108.5050),
             ("Đà Lạt", 11.9404, 108.4583),
         ],
     },
@@ -191,10 +209,11 @@ def _filter_waypoints_between(origin: Coord, destination: Coord, named_points: L
         lat = float(lat); lon = float(lon)
         if not (lat_lo <= lat <= lat_hi):
             continue
-        # bỏ điểm gần origin/destination để OSRM không loop ở đầu/cuối
-        if abs(lat - o_lat) < 0.25 and abs(lon - o_lon) < 0.35:
+        # Chỉ bỏ điểm gần như trùng chính xác. Không bỏ Trại Mát/Cầu Đất gần Đà Lạt,
+        # vì chúng là waypoint bắt buộc để thoát khỏi Liên Khương - Prenn.
+        if abs(lat - o_lat) < 0.015 and abs(lon - o_lon) < 0.015:
             continue
-        if abs(lat - d_lat) < 0.25 and abs(lon - d_lon) < 0.35:
+        if abs(lat - d_lat) < 0.015 and abs(lon - d_lon) < 0.015:
             continue
         pts.append((name, lat, lon))
     pts.sort(key=lambda x: x[1], reverse=not going_north)
