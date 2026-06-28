@@ -19,6 +19,9 @@ except Exception:
 # Các từ khóa thường xuất hiện trong step/instruction/tên đường khi route có cao tốc.
 # OSRM public server không phải lúc nào trả full OSM tags nên ta kiểm tra cả instruction/name/ref.
 EXPRESSWAY_KEYWORDS = (
+    # Chỉ giữ các dấu hiệu thật sự là cao tốc.
+    # KHÔNG dùng keyword "highway" vì trong OSM "highway" là tag chung cho rất nhiều loại đường,
+    # gồm cả quốc lộ/tỉnh lộ/đường chính; nếu bắt chữ này sẽ làm graph xe máy bị đứt giả.
     "cao tốc",
     "duong cao toc",
     "đường cao tốc",
@@ -27,7 +30,6 @@ EXPRESSWAY_KEYWORDS = (
     "motorway",
     "motorway_link",
     "freeway",
-    "highway",
     "đct",
     "dct",
     "ct.",
@@ -106,16 +108,56 @@ def iter_route_steps(route: Dict[str, Any] | None) -> Iterable[Dict[str, Any]]:
     return []
 
 
+def _step_classes(step: Dict[str, Any]) -> List[str]:
+    """Lấy classes/mode từ OSRM step nếu routing.py có lưu raw metadata."""
+    out: List[str] = []
+    for key in ("classes", "mode", "highway"):
+        val = step.get(key)
+        if isinstance(val, list):
+            out.extend(str(x).lower() for x in val)
+        elif val:
+            out.append(str(val).lower())
+    raw = step.get("raw")
+    if isinstance(raw, dict):
+        for key in ("classes", "mode", "highway"):
+            val = raw.get(key)
+            if isinstance(val, list):
+                out.extend(str(x).lower() for x in val)
+            elif val:
+                out.append(str(val).lower())
+    return out
+
+
 def route_has_expressway(route: Dict[str, Any] | None) -> Tuple[bool, str]:
-    """Phát hiện tuyến có dấu hiệu cao tốc từ steps/instructions."""
+    """Phát hiện tuyến có cao tốc/ĐCT, nhưng không loại nhầm quốc lộ/tỉnh lộ.
+
+    Nguyên tắc:
+    - Xe máy chỉ bị chặn khi có dấu hiệu rõ: motorway/motorway_link/expressway/cao tốc/ĐCT/CTxx.
+    - Không coi chữ "highway" là cao tốc vì đó là tag chung của OSM.
+    - QL1A, QL14, đường Hồ Chí Minh, tỉnh lộ... vẫn được giữ nếu OSRM trả qua chúng.
+    """
     for step in iter_route_steps(route):
         txt = _step_text(step)
-        # ĐCT thường xuất hiện dạng ĐCT01 / CT.01 / Cao tốc ...
-        if re.search(r"\b(dct|đct)\s*\d*\b", txt) or re.search(r"\bct[ .-]?\d+\b", txt):
-            return True, step.get("instruction") or step.get("name") or "cao tốc/ĐCT"
+        classes = _step_classes(step)
+        detail = step.get("instruction") or step.get("name") or step.get("ref") or "cao tốc/ĐCT"
+
+        if any(c in {"motorway", "motorway_link"} for c in classes):
+            return True, detail
+
+        # ĐCT/CT có số hiệu: ĐCT01, DCT01, CT.01, CT-01...
+        if re.search(r"\b(dct|đct)\s*\d+\b", txt) or re.search(r"\bct[ .-]?\d+\b", txt):
+            return True, detail
+
+        # Cụm từ rõ nghĩa cao tốc.
+        if "cao toc" in txt or "cao tốc" in txt or "expressway" in txt or "motorway" in txt or "freeway" in txt:
+            return True, detail
+
+        # Không bắt các tên hợp lệ như QL1A/QL14/QL20/tỉnh lộ/đường Hồ Chí Minh.
         for kw in EXPRESSWAY_KEYWORDS:
+            if kw in {"highway"}:
+                continue
             if kw in txt:
-                return True, step.get("instruction") or step.get("name") or kw
+                return True, detail
     return False, ""
 
 
