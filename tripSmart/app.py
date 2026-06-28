@@ -3315,80 +3315,71 @@ elif "Tìm đường" in menu:
             if not lat1 or not lat2:
                 st.error("❌ Không lấy được tọa độ. Thử `10.77,106.69`"); st.stop()
 
-            with st.spinner("🛣️ Tính tuyến (OSRM)..."):
-                if show_alt:
-                    routes = router.get_alternative_routes((lat1,lon1),(lat2,lon2),mode=mode,count=3)
-                else:
-                    r = router.get_route((lat1,lon1),(lat2,lon2),mode=mode)
-                    routes = [r] if r else []
-
-            if not routes:
-                st.error("❌ Không tìm được tuyến."); st.stop()
-
-            # Legal Route Filter: chỉ nhận tuyến hợp lệ với Ô tô/Xe máy.
-            valid_routes, rejected_routes = filter_routes_for_mode(routes, mode)
-            if rejected_routes:
-                _first_issue = (rejected_routes[0].get("legal_issues") or ["Tuyến không phù hợp với phương tiện đã chọn."])[0]
-                st.warning(f"⚖️ Đã loại {len(rejected_routes)} tuyến không hợp lệ với phương tiện: {_first_issue}")
-
-            # Nếu tuyến đầu bị loại vì xe máy gặp cao tốc, KHÔNG dừng ngay.
-            # Thử thêm alternative routes và waypoint vòng để tìm tuyến khác hợp lệ.
-            if not valid_routes and normalize_mode(mode) == "motorbike":
-                with st.spinner("🏍️ Tuyến đầu có cao tốc. Đang thử tuyến khác cho xe máy..."):
-                    fb_valid, fb_rejected, fb_attempts = find_legal_routes_with_fallback(
-                        router, (lat1, lon1), (lat2, lon2), mode=mode, count=3
-                    )
-                rejected_routes = (rejected_routes or []) + (fb_rejected or [])
-
-                # Nếu có tuyến fallback nhưng vòng quá xa so với tuyến bị loại đầu tiên thì không nhận.
-                _base_km = None
-                try:
-                    if rejected_routes:
-                        _base_km = float(rejected_routes[0].get("distance_km") or rejected_routes[0].get("distance") or 0)
-                        if _base_km and _base_km > 1000:
-                            _base_km = _base_km / 1000.0
-                except Exception:
-                    _base_km = None
-
-                _reasonable_fb = []
-                for _rt in fb_valid or []:
+            # Vehicle-aware routing.
+            # Xe máy không được lấy tuyến OSRM driving/cao tốc làm mốc rồi tự loại vì "vòng xa".
+            # Bộ find_legal_routes_with_fallback() đã tự thử: tuyến chính, alternatives,
+            # corridor xe máy và waypoint fallback; sau đó chọn tuyến hợp lệ ngắn nhất.
+            if normalize_mode(mode) == "motorbike":
+                with st.spinner("🏍️ Tính tuyến hợp lệ cho xe máy..."):
                     try:
-                        _new_km = float(_rt.get("distance_km") or _rt.get("distance") or 0)
-                        if _new_km and _new_km > 1000:
-                            _new_km = _new_km / 1000.0
-                    except Exception:
-                        _new_km = 0.0
-                    # Với xe máy, nếu tuyến tham chiếu là tuyến cao tốc bị loại,
-                    # không so quá chặt theo công thức tuyến vòng thường.
-                    # Đi đường gom/quốc lộ dài hơn 20–40% là bình thường và hợp pháp.
-                    if normalize_mode(mode) == "motorbike":
-                        _ok_detour = (not _base_km) or is_reasonable_motorbike_avoid_expressway(_base_km, _new_km)
-                        _limit_txt = motorbike_avoid_expressway_limit_text(_base_km)
-                    else:
-                        _ok_detour = (not _base_km) or is_reasonable_detour(_base_km, _new_km)
-                        _limit_txt = detour_limit_text(_base_km)
+                        fb_valid, fb_rejected, fb_attempts = find_legal_routes_with_fallback(
+                            router,
+                            (lat1, lon1),
+                            (lat2, lon2),
+                            mode=mode,
+                            count=3,
+                            prefer_alternatives=True,
+                        )
+                    except TypeError:
+                        # Tương thích nếu legal_route_filter.py cũ chưa có tham số prefer_alternatives.
+                        fb_valid, fb_rejected, fb_attempts = find_legal_routes_with_fallback(
+                            router,
+                            (lat1, lon1),
+                            (lat2, lon2),
+                            mode=mode,
+                            count=3,
+                        )
 
-                    if _ok_detour:
-                        _reasonable_fb.append(_rt)
-                    else:
-                        _rt["legal_issues"] = [f"Tuyến tránh hợp lệ nhưng vòng quá xa ({_new_km:.1f} km; giới hạn {_limit_txt})."]
-                        rejected_routes.append(_rt)
+                routes = list(fb_valid or [])
+                rejected_routes = list(fb_rejected or [])
 
-                if _reasonable_fb:
-                    valid_routes = _reasonable_fb
-                    st.success("✅ Đã tìm được tuyến khác phù hợp hơn cho xe máy, không dùng tuyến cao tốc bị loại.")
+                if routes:
+                    st.success("✅ Đã tìm được tuyến phù hợp cho xe máy.")
                 else:
-                    with st.expander("Các lần app đã thử tìm tuyến khác", expanded=False):
+                    st.error("❌ Chưa tìm được tuyến hợp lệ cho xe máy.")
+                    with st.expander("Các lần app đã thử tìm tuyến khác", expanded=True):
                         for _a in fb_attempts or []:
                             st.write("- " + str(_a))
+                    with st.expander("Chi tiết tuyến bị loại", expanded=False):
+                        for idx, rr in enumerate(rejected_routes or [], 1):
+                            st.write(f"Tuyến {idx}: " + "; ".join(rr.get("legal_issues") or []))
+                    st.stop()
 
-            routes = valid_routes
-            if not routes:
-                st.error("❌ Chưa tìm được tuyến hợp lệ với phương tiện đã chọn. App đã thử tuyến thay thế/waypoint vòng, nhưng các tuyến tìm được vẫn có cao tốc/ĐCT hoặc vòng quá xa.")
-                with st.expander("Chi tiết tuyến bị loại", expanded=False):
-                    for idx, rr in enumerate(rejected_routes, 1):
-                        st.write(f"Tuyến {idx}: " + "; ".join(rr.get("legal_issues") or []))
-                st.stop()
+            else:
+                with st.spinner("🛣️ Tính tuyến (OSRM)..."):
+                    if show_alt:
+                        routes = router.get_alternative_routes((lat1, lon1), (lat2, lon2), mode=mode, count=3)
+                    else:
+                        r = router.get_route((lat1, lon1), (lat2, lon2), mode=mode)
+                        routes = [r] if r else []
+
+                if not routes:
+                    st.error("❌ Không tìm được tuyến.")
+                    st.stop()
+
+                # Legal Route Filter: chỉ nhận tuyến hợp lệ với Ô tô/Xe máy.
+                valid_routes, rejected_routes = filter_routes_for_mode(routes, mode)
+                if rejected_routes:
+                    _first_issue = (rejected_routes[0].get("legal_issues") or ["Tuyến không phù hợp với phương tiện đã chọn."])[0]
+                    st.warning(f"⚖️ Đã loại {len(rejected_routes)} tuyến không hợp lệ với phương tiện: {_first_issue}")
+
+                routes = valid_routes
+                if not routes:
+                    st.error("❌ Chưa tìm được tuyến hợp lệ với phương tiện đã chọn.")
+                    with st.expander("Chi tiết tuyến bị loại", expanded=False):
+                        for idx, rr in enumerate(rejected_routes, 1):
+                            st.write(f"Tuyến {idx}: " + "; ".join(rr.get("legal_issues") or []))
+                    st.stop()
 
             # Chuẩn hóa ETA theo tốc độ trung bình đang chọn:
             # mặc định: ô tô/xe máy 40 km/h, xe đạp 20 km/h, đi bộ 5 km/h;
