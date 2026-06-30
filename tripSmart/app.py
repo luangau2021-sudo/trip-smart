@@ -1382,6 +1382,111 @@ CO2_G_PER_KM_BY_MODE = {
 
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REST STOP MAP FILTER — hiển thị điểm nghỉ cách nhau khoảng 150km
+# ─────────────────────────────────────────────────────────────────────────────
+def _ts_pick_rest_every_km(rest_stops, step_km=150.0, tolerance_km=40.0, max_results=20):
+    """
+    Chọn điểm nghỉ rải đều dọc tuyến để map không bị quá nhiều marker.
+    Chỉ ảnh hưởng phần HIỂN THỊ marker điểm nghỉ trên bản đồ, không đổi AI/routing/ETA.
+    """
+    if not rest_stops:
+        return []
+
+    clean = []
+    for x in rest_stops or []:
+        if not isinstance(x, dict):
+            continue
+
+        # Cố gắng đọc vị trí km dọc tuyến từ nhiều tên field khác nhau.
+        rk = None
+        for key in ("route_km", "km", "distance_km", "segment_km", "distance_along_km", "at_km"):
+            try:
+                if x.get(key) is not None:
+                    rk = float(x.get(key) or 0.0)
+                    break
+            except Exception:
+                pass
+
+        # Nếu không có route_km thì vẫn giữ lại vài marker đầu, tránh mất hết điểm nghỉ.
+        if rk is None:
+            rk = 0.0
+
+        y = dict(x)
+        y["_ts_rest_route_km"] = rk
+        clean.append(y)
+
+    if not clean:
+        return []
+
+    clean.sort(key=lambda x: float(x.get("_ts_rest_route_km", 0.0) or 0.0))
+
+    try:
+        max_route_km = max(float(x.get("_ts_rest_route_km", 0.0) or 0.0) for x in clean)
+    except Exception:
+        max_route_km = 0.0
+
+    # Nếu dữ liệu điểm nghỉ không có route_km thật, chỉ giới hạn số lượng để tránh map nặng.
+    if max_route_km <= 0.1:
+        out = []
+        seen = set()
+        for x in clean:
+            key = (
+                str(x.get("name") or x.get("title") or "Điểm nghỉ"),
+                round(float(x.get("lat", 0) or 0), 5),
+                round(float(x.get("lon", 0) or 0), 5),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            x.pop("_ts_rest_route_km", None)
+            out.append(x)
+            if len(out) >= int(max_results or 20):
+                break
+        return out
+
+    picked = []
+    used = set()
+    target = 0.0
+    step_km = max(50.0, float(step_km or 150.0))
+    tolerance_km = max(10.0, float(tolerance_km or 40.0))
+    max_results = max(1, int(max_results or 20))
+
+    while target <= max_route_km + tolerance_km and len(picked) < max_results:
+        low = max(0.0, target - tolerance_km)
+        high = target + tolerance_km
+        candidates = [
+            x for x in clean
+            if low <= float(x.get("_ts_rest_route_km", 0.0) or 0.0) <= high
+        ]
+
+        if candidates:
+            best = sorted(
+                candidates,
+                key=lambda x: (
+                    abs(float(x.get("_ts_rest_route_km", 0.0) or 0.0) - target),
+                    float(x.get("dist_from_route_km", 99.0) or 99.0),
+                ),
+            )[0]
+
+            key = (
+                str(best.get("name") or best.get("title") or "Điểm nghỉ"),
+                round(float(best.get("lat", 0) or 0), 5),
+                round(float(best.get("lon", 0) or 0), 5),
+            )
+            if key not in used:
+                used.add(key)
+                best.pop("_ts_rest_route_km", None)
+                picked.append(best)
+
+        target += step_km
+
+    picked.sort(key=lambda x: float(x.get("route_km") or x.get("km") or x.get("distance_km") or 0.0))
+    return picked
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VISUAL APP-LIKE HOME + ACCESSIBLE NAVIGATION HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4201,7 +4306,7 @@ elif "Tìm đường" in menu:
             route_polyline=_gps_progress_polyline if gps_position else polyline,
             alt_routes=alt_routes_other,
             danger_markers=danger_markers,
-            rest_suggestions=rest_stops,
+            rest_suggestions=_ts_pick_rest_every_km(rest_stops, step_km=150.0, tolerance_km=40.0, max_results=20),
             pois=((fuel_stations_for_map or []) + pois),
             reports=rpts,
             forecast_segments=(st.session_state.get("auto_eta_forecast") or route_risk_forecast or {}).get("segments"),
